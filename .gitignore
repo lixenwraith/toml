@@ -1,0 +1,8 @@
+.idea
+bin/
+dev/
+logs/
+log/
+examples/
+catalog.txt
+combined.txt
