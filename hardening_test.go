@@ -116,6 +116,9 @@ func FuzzIntegerConversions(f *testing.F) {
 	f.Add(uint64(math.MaxUint64))
 	f.Add(uint64(1<<53) + 1)
 	f.Add(uint64(0))
+	f.Add(uint64(255))
+	f.Add(uint64(256))
+	f.Add(uint64(1 << 63))
 	f.Fuzz(func(t *testing.T, n uint64) {
 		var u uint64
 		if err := Decode(n, &u); err != nil || u != n {
@@ -128,6 +131,11 @@ func FuzzIntegerConversions(f *testing.F) {
 		}
 		if err == nil && uint64(i) != n {
 			t.Fatal("signed conversion changed value")
+		}
+		var b uint8
+		err = Decode(n, &b)
+		if (err == nil) != (n <= math.MaxUint8) || err == nil && uint64(b) != n {
+			t.Fatalf("narrow conversion changed value: %d -> %d (%v)", n, b, err)
 		}
 	})
 }

@@ -62,7 +62,8 @@ func TestDecode_DeepPointers(t *testing.T) {
 
 func TestDecode_LargeIntPrecision(t *testing.T) {
 	largeVal := int64(4611686018427387905)
-	data := map[string]any{"id": int(largeVal)}
+	// Keep the source value intact on 32-bit platforms too.
+	data := map[string]any{"id": largeVal}
 
 	type T struct {
 		ID int64 `toml:"id"`

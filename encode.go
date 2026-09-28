@@ -13,7 +13,8 @@ import (
 )
 
 // Marshal encodes a struct or string-keyed map with deterministic key order.
-// Nil table fields are omitted; nil array elements, cycles/excessive nesting,
+// Nil pointer/interface fields are omitted; nil pointer/interface array elements,
+// cycles/excessive nesting,
 // non-finite floats, and integers outside TOML's signed 64-bit range error.
 // Comments and whitespace are not retained. Datetimes are not supported.
 func Marshal(v any) ([]byte, error) {

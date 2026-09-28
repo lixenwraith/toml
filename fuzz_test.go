@@ -2,8 +2,8 @@ package toml
 
 import (
 	"reflect"
+	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func FuzzParse(f *testing.F) {
@@ -57,24 +57,25 @@ func FuzzRoundTrip(f *testing.F) {
 		`m = { x = 1, y = { z = "q" } }`,
 		`u = "日本語 \u00E9"`,
 		"big = 1e100\nsmall = 1e-100",
+		`"a.b" = { "c d" = 1 }`,
+		`mixed = [1, {value = "x"}, [{nested = true}]]`,
+		"[[outer]]\n[outer.\"inner.key\"]\nx = \"\\b\\f\"\n[[outer]]\nx = 2",
 	} {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Encoder normalizes invalid UTF-8 to U+FFFD (WriteRune); byte-exact
-		// round trip is only a property of valid input.
-		if !utf8.Valid(data) {
-			t.Skip()
-		}
 		m1, err := NewParser(data).Parse()
 		if err != nil {
 			t.Skip()
 		}
 		out, err := Marshal(m1)
 		if err != nil {
-			// Parser accepts values the encoder cannot represent
-			// (mixed table/scalar arrays). Documented asymmetry.
-			t.Skip()
+			// Separate dotted paths may form a tree deeper than the encoder's
+			// documented whole-value bound. No other encode failure is allowed.
+			if strings.Contains(err.Error(), "nesting exceeds") {
+				t.Skip()
+			}
+			t.Fatalf("parsed value cannot be encoded: %v", err)
 		}
 		m2, err := NewParser(out).Parse()
 		if err != nil {
