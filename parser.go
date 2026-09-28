@@ -258,7 +258,7 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 
 		if p.curToken.Type == TokenString {
 			// Rule: Even quoted strings shouldn't be pure numbers per instruction
-			if _, err := strconv.ParseInt(p.curToken.Literal, 10, 64); err == nil {
+			if numericKey(p.curToken.Literal) {
 				return nil, fmt.Errorf("numeric string keys are forbidden: %q", p.curToken.Literal)
 			}
 		}
@@ -439,4 +439,20 @@ func signPrefix(negative bool) string {
 		return "-"
 	}
 	return ""
+}
+
+// Keep the package's decimal-key restriction independent of numeric range.
+func numericKey(s string) bool {
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !isDigit(c) {
+			return false
+		}
+	}
+	return true
 }

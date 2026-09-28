@@ -57,12 +57,14 @@ func entries(v reflect.Value) ([]entry, error) {
 		if v.Type().Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map keys must be strings")
 		}
+		out = make([]entry, 0, v.Len())
 		it := v.MapRange()
 		for it.Next() {
 			out = append(out, entry{it.Key().String(), it.Value()})
 		}
 	case reflect.Struct:
 		t := v.Type()
+		out = make([]entry, 0, t.NumField())
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
 			if !f.IsExported() {
@@ -237,7 +239,7 @@ func keyText(s string) (string, error) {
 	if !utf8.ValidString(s) {
 		return "", fmt.Errorf("invalid UTF-8 key")
 	}
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+	if numericKey(s) {
 		return "", fmt.Errorf("numeric keys are forbidden: %q", s)
 	}
 	if isBareKey(s) {

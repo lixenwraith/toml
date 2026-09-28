@@ -17,15 +17,16 @@ func Unmarshal(data []byte, v any) error {
 	return Decode(parsedMap, v)
 }
 
-// Decode maps a generic map[string]any to a struct/slice/etc using reflection.
-// It prioritizes `toml` tags and falls back to field names.
+// Decode maps parser values to typed destinations using reflection.
+// It uses toml tags, falling back to field names, and leaves v unchanged on error.
+// Interface destinations retain the input value, including container references.
 func Decode(data any, v any) error {
 	val := reflect.ValueOf(v)
 	if val.Kind() != reflect.Ptr || val.IsNil() {
 		return fmt.Errorf("target must be a non-nil pointer")
 	}
 
-	// Decode into a detached value so errors never partially update the target.
+	// Stage changes; pointer, map and slice branches allocate before writing.
 	next := reflect.New(val.Elem().Type()).Elem()
 	next.Set(val.Elem())
 	if err := decodeValue(data, next); err != nil {
@@ -51,6 +52,9 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 	case reflect.Ptr:
 		elemType := val.Type().Elem()
 		newVal := reflect.New(elemType)
+		if !val.IsNil() {
+			newVal.Elem().Set(val.Elem())
+		}
 		if err := decodeAt(data, newVal.Elem(), depth+1); err != nil {
 			return err
 		}
@@ -63,7 +67,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		}
 		return decodeStruct(dataMap, val, depth+1)
 
-	case reflect.Slice:
+	case reflect.Slice, reflect.Array:
 		dataSlice, ok := data.([]any)
 		if !ok {
 			if mapSlice, ok := data.([]map[string]any); ok {
@@ -76,10 +80,18 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 			}
 		}
 
-		newSlice := reflect.MakeSlice(val.Type(), len(dataSlice), len(dataSlice))
+		var newSlice reflect.Value
+		if val.Kind() == reflect.Array {
+			if len(dataSlice) != val.Len() {
+				return fmt.Errorf("expected array length %d, got %d", val.Len(), len(dataSlice))
+			}
+			newSlice = reflect.New(val.Type()).Elem()
+		} else {
+			newSlice = reflect.MakeSlice(val.Type(), len(dataSlice), len(dataSlice))
+		}
 		for i := 0; i < len(dataSlice); i++ {
 			if err := decodeAt(dataSlice[i], newSlice.Index(i), depth+1); err != nil {
-				return err
+				return fmt.Errorf("index %d: %w", i, err)
 			}
 		}
 		val.Set(newSlice)
@@ -92,7 +104,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		if !ok {
 			return fmt.Errorf("expected map, got %T", data)
 		}
-		newMap := reflect.MakeMap(val.Type())
+		newMap := reflect.MakeMapWithSize(val.Type(), len(dataMap))
 		elemType := val.Type().Elem()
 		for k, vData := range dataMap {
 			newVal := reflect.New(elemType).Elem()
@@ -123,15 +135,16 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		val.SetInt(i)
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		i, ok := toUint64(data)
+		u, ok := toUint64(data)
 		if !ok {
-			return fmt.Errorf("cannot convert %v (%T) to uint without loss", data, data)
+			// Formatting a rejected container's value could recurse through a cycle.
+			return fmt.Errorf("cannot convert %T to uint without loss", data)
 		}
 		// Overflow check
-		if val.OverflowUint(uint64(i)) {
-			return fmt.Errorf("value %d overflows %s", i, val.Type())
+		if val.OverflowUint(u) {
+			return fmt.Errorf("value %d overflows %s", u, val.Type())
 		}
-		val.SetUint(uint64(i))
+		val.SetUint(u)
 
 	case reflect.Float32, reflect.Float64:
 		f, ok := toFloat(data, val.Type().Bits())
