@@ -1,0 +1,17 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: GOARCH=386 go test ./...
+      - run: go vet ./...
+      - run: go test -run '^$' -fuzz '^FuzzRoundTrip$' -fuzztime=15s -parallel=2
+      - run: go test -run '^$' -fuzz '^FuzzIntegerConversions$' -fuzztime=10s -parallel=2

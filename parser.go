@@ -4,10 +4,8 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"unicode/utf8"
 )
-
-// Enforce 64-bit platform; fails compilation on 32-bit targets where int(int64) in parseInteger would truncate
-const _ uint = 1<<63 - 1
 
 // Parser parses TOML tokens into a map[string]any
 type Parser struct {
@@ -49,6 +47,9 @@ func (p *Parser) nextToken() {
 }
 
 func (p *Parser) Parse() (map[string]any, error) {
+	if !utf8.Valid(p.lexer.input) {
+		return nil, fmt.Errorf("invalid UTF-8")
+	}
 	for p.curToken.Type != TokenEOF {
 		if p.curToken.Type == TokenNewline {
 			p.nextToken()
@@ -57,6 +58,9 @@ func (p *Parser) Parse() (map[string]any, error) {
 
 		if err := p.parseStatement(); err != nil {
 			return nil, err
+		}
+		if p.curToken.Type != TokenNewline && p.curToken.Type != TokenEOF {
+			return nil, fmt.Errorf("expected newline at line %d", p.curToken.Line)
 		}
 	}
 	return p.root, nil
@@ -254,7 +258,7 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 
 		if p.curToken.Type == TokenString {
 			// Rule: Even quoted strings shouldn't be pure numbers per instruction
-			if _, err := strconv.Atoi(p.curToken.Literal); err == nil {
+			if _, err := strconv.ParseInt(p.curToken.Literal, 10, 64); err == nil {
 				return nil, fmt.Errorf("numeric string keys are forbidden: %q", p.curToken.Literal)
 			}
 		}
@@ -263,6 +267,9 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 			return nil, fmt.Errorf("expected key, got %s", p.curToken.String())
 		}
 
+		if len(keys) >= maxValueDepth {
+			return nil, fmt.Errorf("key nesting exceeds %d", maxValueDepth)
+		}
 		keys = append(keys, p.curToken.Literal)
 		p.nextToken()
 
@@ -314,7 +321,7 @@ func (p *Parser) parseValue() (any, error) {
 	return nil, fmt.Errorf("unexpected value token %s at line %d", p.curToken.String(), p.curToken.Line)
 }
 
-func (p *Parser) parseInteger(lit string) (int, error) {
+func (p *Parser) parseInteger(lit string) (int64, error) {
 	// Handle optional leading sign
 	negative := false
 	numLit := lit
@@ -329,26 +336,23 @@ func (p *Parser) parseInteger(lit string) (int, error) {
 	if len(numLit) > 2 && numLit[0] == '0' {
 		switch numLit[1] {
 		case 'x', 'X':
-			val, err = strconv.ParseInt(numLit[2:], 16, 64)
+			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 16, 64)
 		case 'o', 'O':
-			val, err = strconv.ParseInt(numLit[2:], 8, 64)
+			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 8, 64)
 		case 'b', 'B':
-			val, err = strconv.ParseInt(numLit[2:], 2, 64)
+			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 2, 64)
 		default:
 			val, err = strconv.ParseInt(lit, 10, 64)
-			return int(val), err
+			return val, err
 		}
 		if err != nil {
 			return 0, err
 		}
-		if negative {
-			val = -val
-		}
-		return int(val), nil
+		return val, nil
 	}
 
 	val, err = strconv.ParseInt(lit, 10, 64)
-	return int(val), err
+	return val, err
 }
 
 func (p *Parser) parseArray() ([]any, error) {
@@ -367,15 +371,12 @@ func (p *Parser) parseArray() ([]any, error) {
 		}
 		arr = append(arr, val)
 
+		for p.curToken.Type == TokenNewline {
+			p.nextToken()
+		}
 		if p.curToken.Type == TokenComma {
 			p.nextToken()
 		} else if p.curToken.Type != TokenRBracket {
-			// Check for newlines between elements if missing comma? TOML usually requires comma.
-			// Relaxed parser: require comma unless followed immediately by bracket (trailing comma allowed)
-			if p.curToken.Type == TokenNewline {
-				p.nextToken()
-				continue
-			}
 			return nil, fmt.Errorf("expected comma or closing bracket in array at line %d", p.curToken.Line)
 		}
 	}
@@ -414,13 +415,12 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 			return nil, err
 		}
 
+		for p.curToken.Type == TokenNewline {
+			p.nextToken()
+		}
 		if p.curToken.Type == TokenComma {
 			p.nextToken()
 		} else if p.curToken.Type != TokenRBrace {
-			if p.curToken.Type == TokenNewline {
-				p.nextToken()
-				continue
-			}
 			return nil, fmt.Errorf("expected comma or closing brace in inline table at line %d", p.curToken.Line)
 		}
 	}
@@ -432,4 +432,11 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 	// dotted keys ({a.b = 1}) remain unaffected.
 	p.frozen[reflect.ValueOf(m).Pointer()] = true
 	return m, nil
+}
+
+func signPrefix(negative bool) string {
+	if negative {
+		return "-"
+	}
+	return ""
 }

@@ -329,7 +329,7 @@ func (l *Lexer) readString() Token {
 
 	for l.pos < len(l.input) {
 		ch := l.peek()
-		if ch == '\n' {
+		if ch < 0x20 && ch != '\t' || ch == 0x7f {
 			return l.newToken(TokenError, "unterminated string: newline in basic string")
 		}
 		if ch == '"' && !escaped {
@@ -353,6 +353,10 @@ func (l *Lexer) readString() Token {
 				result = append(result, '\t')
 			case 'r':
 				result = append(result, '\r')
+			case 'b':
+				result = append(result, '\b')
+			case 'f':
+				result = append(result, '\f')
 			case 'u', 'U':
 				n := 4
 				if ch == 'U' {
@@ -427,4 +431,3 @@ func isOctalDigit(r rune) bool {
 func isBinaryDigit(r rune) bool {
 	return r == '0' || r == '1'
 }
-

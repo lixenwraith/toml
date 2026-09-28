@@ -191,11 +191,11 @@ mid_val = 2
 	}
 
 	a := res["a"].(map[string]any)
-	if a["root_val"] != 1 {
+	if a["root_val"] != int64(1) {
 		t.Errorf("Missing root_val: %v", a["root_val"])
 	}
 	b := a["b"].(map[string]any)
-	if b["mid_val"] != 2 {
+	if b["mid_val"] != int64(2) {
 		t.Errorf("Missing mid_val: %v", b["mid_val"])
 	}
 }
@@ -384,7 +384,7 @@ i = 5
 
 	a := res["a"].(map[string]any)
 	b := a["b"].(map[string]any)
-	if b["i"] != 5 {
+	if b["i"] != int64(5) {
 		t.Errorf("Value 'i' lost in table reentry. Got %v", b["i"])
 	}
 	if _, ok := b["c"].(map[string]any); !ok {
