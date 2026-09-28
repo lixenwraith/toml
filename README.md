@@ -1,154 +1,106 @@
 # toml
 
-Zero-dependency TOML encoder/decoder for Go.
-Implements a practical subset of TOML v1.0 with documented deviations.
-Standard library only.
-
-## Install
-
-    go get github.com/lixenwraith/toml
-
-## Usage
-
-### Unmarshal
+A deterministic TOML subset encoder/decoder using only the standard library.
+Requires Go 1.27.1.
 
 ```go
-input := []byte(`
-initial = "Idle"
-
-[states.Idle]
-parent = "Root"
-transitions = [
-    { trigger = "Start", target = "Active" }
-]
-`)
-
-type Transition struct {
-    Trigger string `toml:"trigger"`
-    Target  string `toml:"target"`
-    Guard   string `toml:"guard,omitempty"`
+type Settings struct {
+    Name string `toml:"name"`
+    Port uint16 `toml:"port"`
 }
-type State struct {
-    Parent      string       `toml:"parent"`
-    Transitions []Transition `toml:"transitions"`
-}
-type Config struct {
-    Initial string            `toml:"initial"`
-    States  map[string]*State `toml:"states"`
-}
-
-var cfg Config
-err := toml.Unmarshal(input, &cfg)
+var settings Settings
+err := toml.Unmarshal([]byte("name = \"service\"\nport = 8080\n"), &settings)
+data, err := toml.Marshal(settings)
 ```
 
-### Marshal
+`NewParser(data).Parse()` returns `map[string]any`. `Decode(data, &target)`
+converts an already parsed value. Errors leave the destination unchanged.
+Missing struct fields retain their existing values; present maps and slices
+replace old containers. Existing pointer defaults are retained without writing
+through the original pointer. Fixed arrays require an exact input length.
+Tags use `toml:"name,omitempty"`; an empty tag name
+falls back to the Go field name. Matching is case sensitive. Unknown input keys
+and unexported fields are ignored.
 
-```go
-out, err := toml.Marshal(cfg) // deterministic: keys sorted alphabetically
-```
+## Values and conversions
 
-### Decode
+| TOML value | Parsed Go value | Typed destinations |
+| --- | --- | --- |
+| Integer | `int64`, on every architecture | Checked integer and float types |
+| Float | `float64` | Float types; integers only when integral and in range |
+| String | `string` | `string`, `any` |
+| Boolean | `bool` | `bool`, `any` |
+| Array | `[]any` | Slices, fixed arrays, `any` |
+| Table | `map[string]any` | Structs, string-keyed maps, `any` |
+| Array of tables | `[]map[string]any` | Slices and fixed arrays, including pointer elements |
 
-`Decode(data any, v any)` maps an already-parsed `map[string]any` onto a
-target. `Unmarshal` = `Parse` + `Decode`.
+Direct `Decode` supports all signed/unsigned numeric widths and named numeric
+types, including the full `uint64` range. Conversions reject overflow, negative
+unsigned inputs, fractional-to-integer truncation, non-finite floats, and
+integer-to-float precision loss. Float64-to-float32 rounding is allowed when in
+range. Strings are not coerced to numbers by this package.
 
-## Architecture
+`Decode` is transactional, not a deep-copy or synchronization API. Interface
+destinations retain input values (including map and slice references); unchanged
+fields may retain existing references. A nil input is a no-op. Callers own
+snapshot isolation and synchronization when values are shared between goroutines.
 
-    Unmarshal: []byte → Lexer → tokens → Parser → map[string]any → Decode (reflection) → target
-    Marshal:   value → encoder (reflection, two-pass) → []byte
+TOML integer literals have a signed 64-bit range. Consequently `Marshal` rejects
+unsigned values above `MaxInt64`; callers may explicitly encode decimal strings
+and interpret those in their application. Integer parsing and narrow destination
+checks also work on 32-bit systems.
 
-### Lexer (`lexer.go`)
+## Encoding and round trips
 
-- Single-pass, UTF-8 aware byte scanner with rune lookahead (`peekAt`).
-- Emits: ident, string, integer, float, bool, punctuation, newline, comment.
-- Number/key disambiguation happens at the token level: `1.5` → Float,
-  `a.b` → Ident Dot Ident, `1.2.3` → Error (multi-dot). Hex/octal/binary
-  prefixes and exponent forms are validated during scanning.
-- Basic strings only. Escapes: `\"` `\\` `\n` `\t` `\r`. Unknown escape
-  sequences are preserved verbatim (spec requires an error — see Deviations).
+`Marshal` accepts a struct or string-keyed map, including pointers to them. Keys
+are sorted. Scalar fields precede nested tables. Table path segments are quoted
+individually, preserving dots, spaces, quotes and Unicode in keys. Mixed arrays
+and nested table values use inline tables when needed. Struct `omitempty` is
+honored; nil pointer/interface fields are omitted. Nil pointer/interface array
+elements error, because TOML has no null value. Nil maps and slices encode as
+empty containers. Duplicate struct tag names error.
 
-### Parser (`parser.go`)
+Basic-string escapes emitted by the encoder (`\b`, `\f`, `\n`, `\r`, `\t`,
+quotes, backslashes, Unicode escapes) decode symmetrically. Invalid UTF-8 and
+unescaped control characters in strings are rejected. Encoding and typed decoding
+have recursion bounds (1000 levels), so cyclic traversals fail instead of
+overflowing the stack. Parsing bounds individual value nesting and dotted paths;
+combining paths can still produce trees that exceed the encoder's bound.
 
-- Recursive descent with a two-token window (`curToken`/`peekToken`).
-  Comments are skipped during token advance.
-- Output model: tables → `map[string]any`, arrays → `[]any`,
-  arrays of tables → `[]map[string]any`.
-- Table headers (`[a.b]`) always resolve from the root; a `current` cursor
-  tracks the active table scope for subsequent key/value pairs.
-- Dotted keys create intermediate maps. Traversal through an existing
-  `[[array]]` descends into its last element (TOML semantics).
-- Conflict detection at assignment: duplicate keys, scalar-vs-table
-  redefinition, table-vs-array-of-tables shadowing. Numeric keys are
-  rejected in all positions (bare, quoted, dotted segments).
-- Inline tables are immutable (later dotted keys or `[headers]` targeting them error); value nesting (arrays/inline tables) capped at 1000 levels.
+Comments and original formatting are not preserved by `Parse`/`Marshal`. A
+configuration editor can scan the original bytes with `NewLexer` and retain
+`TokenComment.Literal` values, then prefix each with `#` and write them as a
+preamble before the marshaled data. This preserves comment text (including
+inline comments), but not its original location. Hashes inside strings are not
+comment tokens. Stop scanning on `TokenEOF` or `TokenError`.
 
-### Decoder (`decode.go`)
+## Deliberate subset and deviations
 
-- Kind-switch reflection. Pointers are auto-allocated at any depth
-  (`******int` works). Nil maps and slices are materialized.
-- Struct fields match by `toml` tag first, then exact (case-sensitive)
-  field name. `toml:"-"` skips. Unexported fields are skipped.
-- Numeric coercion: any parser-produced int/uint/float64 converts to the
-  target numeric kind. Unknown keys in input are ignored.
-- Numeric decode errors on target overflow (`300` → `int8` errors); non-empty interface targets error unless assignable; unsupported target kinds (chan, func, complex, fixed arrays) error; `uint`/`uint64` sources above `MaxInt64` are rejected.
+- Datetime syntax is unsupported. Use quoted strings and parse them in the
+  application; this package does not handle `time.Time` or custom marshal hooks.
+- Literal strings and multiline strings, digit separators, and `inf`/`nan` are
+  unsupported.
+- Decimal integer keys (including quoted keys, optional signs and values beyond
+  int64) are forbidden. This restriction also applies to the encoder.
+- Unknown string escapes are preserved verbatim as a documented relaxation.
+- Explicit table headers may reopen existing tables. Inline tables cannot be
+  extended later.
+- Inline tables allow newlines and trailing commas. Arrays require commas,
+  including between lines. Top-level statements require newline separation.
+- Signed radix integers and uppercase radix prefixes are accepted extensions.
+- Leading zeros are accepted in decimal numbers; `0123` means decimal 123,
+  not octal. Use `0o123` for octal.
+- Embedded struct fields are not promoted. Custom marshal interfaces are not
+  supported. Decode input containers are the parser's generic maps/slices.
 
-### Encoder (`encode.go`)
+## Migration from the initial version
 
-- Two-pass emission per table: scalars and inline arrays first, then
-  `[tables]` and `[[arrays of tables]]`. Guarantees keys are defined
-  before sub-tables, i.e. output is always valid TOML.
-- Keys sorted alphabetically → deterministic output for diffing/VCS.
-- Bare-key validation mirrors the lexer's rules: keys that would lex as
-  numbers or booleans (`true`, `123a`, `-1x`) are quoted, so output always
-  re-parses (round-trip safe).
-- `omitempty` honored; nil pointers and `toml:"-"` fields skipped;
-  root must be a struct or map.
-- Floats use shortest `'g'` form at the source bit width (large magnitudes emit exponent notation); `NaN`/`±Inf` return an error; arrays mixing tables and scalars return an error (parser accepts them — encode-side limitation); struct keys sort by resolved tag name.
+Parsed integers now use `int64`, not machine-sized `int`. Update type assertions
+on raw parser results. Typed struct destinations keep their declared types.
+Previously lossy numeric conversions and nil array elements now error. Mixed
+arrays can now be encoded. All changes have regression and fuzz coverage.
 
-## Type Mapping
+Run `go test -race ./...`, `GOARCH=386 go test ./...`, and, for example,
+`go test -run '^$' -fuzz '^FuzzRoundTrip$' -fuzztime=30s`.
 
-| TOML            | Parser output (`map[string]any`) | Decode targets                    |
-|-----------------|----------------------------------|-----------------------------------|
-| string          | `string`                         | `string`, `any`                   |
-| integer         | `int`                            | any int/uint kind, float kinds    |
-| float           | `float64`                        | `float32`, `float64`              |
-| boolean         | `bool`                           | `bool`                            |
-| array           | `[]any`                          | `[]T`, `any`                      |
-| table           | `map[string]any`                 | struct, `map[string]T`, `any`     |
-| array of tables | `[]map[string]any`               | `[]T`, `[]*T`                     |
-
-## Deviations from TOML v1.0
-
-Intentional restrictions:
-- Numeric keys are forbidden everywhere: `123 = 1`, `[456]`, `"789"`,
-  `a.1.b` all error. Stricter than spec.
-
-Extensions (accepted, though spec forbids):
-- Newlines inside inline tables (multi-line inline tables parse).
-- Trailing commas in inline tables.
-
-Relaxations:
-- Unknown string escapes are preserved instead of erroring.
-- Explicit table redefinition (`[a]` … `[a]`) is not rejected; the second
-  header reopens the table. Value/table conflicts are still caught.
-
-## Limitations
-
-Not supported:
-- Date/time types (all four TOML forms). Workaround: store RFC 3339
-  strings and convert with `time.Parse` at the call site; strings
-  round-trip cleanly.
-- Literal strings `'...'` and multi-line strings `"""..."""`, `'''...'''`.
-- Underscore digit separators (`1_000`).
-- Arrays mixing tables and scalar values are not encodable.
-- `inf` / `nan` float literals.
-- Custom marshaling interfaces (`Marshaler`/`Unmarshaler`,
-  `encoding.TextMarshaler`).
-- Embedded struct field promotion in decode.
-
-Platform note: TOML integers parse to Go `int`; 64-bit platforms assumed (amd64/arm64) and enforced at compile time (32-bit build fails).
-Overflow of int64 during parse errors; 32-bit truncation of `int(int64)` is not guarded.
-
-## License
-
-BSD-3-Clause (see LICENSE).
+BSD-3-Clause; see LICENSE.

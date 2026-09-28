@@ -2,6 +2,8 @@ package toml
 
 import (
 	"math"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -71,7 +73,7 @@ func TestDecode_Uint64Wrap(t *testing.T) {
 	if err := Decode(map[string]any{"v": uint64(math.MaxUint64)}, &tgt); err == nil {
 		t.Errorf("MaxUint64 into int64 must error, got %d", tgt.V)
 	}
-	if err := Decode(map[string]any{"v": uint(math.MaxUint64)}, &tgt); err == nil {
+	if err := Decode(map[string]any{"v": ^uint(0)}, &tgt); strconv.IntSize == 64 && err == nil {
 		t.Errorf("uint wrap into int64 must error, got %d", tgt.V)
 	}
 	if err := Decode(map[string]any{"v": uint64(42)}, &tgt); err != nil || tgt.V != 42 {
@@ -118,23 +120,23 @@ func TestMarshal_NaNInf(t *testing.T) {
 	}
 }
 
-func TestMarshal_SliceHomogeneity(t *testing.T) {
-	if _, err := Marshal(map[string]any{"x": []any{map[string]any{"a": 1}, 2}}); err == nil {
-		t.Error("mixed table/scalar slice must error")
-	}
-	if _, err := Marshal(map[string]any{"x": []any{1, nil, 2}}); err == nil {
-		t.Error("nil interface element must error")
-	}
-
-	type Item struct {
-		N int `toml:"n"`
-	}
-	b, err := Marshal(map[string]any{"items": []*Item{nil, {N: 1}}})
+func TestMarshal_MixedArraysAndNil(t *testing.T) {
+	input := map[string]any{"x": []any{map[string]any{"a": int64(1)}, int64(2)}}
+	data, err := Marshal(input)
 	if err != nil {
-		t.Fatalf("nil pointer in table slice must be skipped, not error: %v", err)
+		t.Fatal(err)
 	}
-	if strings.Count(string(b), "[[items]]") != 1 {
-		t.Errorf("expected exactly one [[items]]:\n%s", b)
+	var got map[string]any
+	if err := Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(input, got) {
+		t.Fatalf("got %#v", got)
+	}
+	for _, value := range []any{[]any{1, nil}, []*struct{ N int }{nil}} {
+		if _, err := Marshal(map[string]any{"x": value}); err == nil {
+			t.Fatal("nil array element accepted")
+		}
 	}
 }
 

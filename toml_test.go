@@ -81,7 +81,7 @@ active = false
 	}
 	// Check int conversion in dynamic map (parser returns int/float, decode handles struct fields, but map keeps raw parser types)
 	// Parser likely returns int for 55.
-	if id, ok := cfg.Owner["id"].(int); !ok || id != 55 {
+	if id, ok := cfg.Owner["id"].(int64); !ok || id != 55 {
 		// Fallback check if parser returned generic float for number
 		if fId, okf := cfg.Owner["id"].(float64); !okf || fId != 55 {
 			t.Errorf("Owner.ID mismatch: got %T %v", cfg.Owner["id"], cfg.Owner["id"])

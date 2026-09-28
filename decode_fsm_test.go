@@ -308,7 +308,7 @@ transitions = [
 		t.Error("GuardArgs is nil")
 	} else if ms, ok := grw.Transitions[0].GuardArgs["ms"]; !ok {
 		t.Error("GuardArgs missing 'ms' key")
-	} else if msInt, ok := ms.(int); !ok || msInt != 2000 {
+	} else if msInt, ok := ms.(int64); !ok || msInt != 2000 {
 		t.Errorf("GuardArgs.ms mismatch: %T %v", ms, ms)
 	}
 }
