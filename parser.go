@@ -254,7 +254,7 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 
 		if p.curToken.Type == TokenString {
 			// Rule: Even quoted strings shouldn't be pure numbers per instruction
-			if _, err := strconv.Atoi(p.curToken.Literal); err == nil {
+			if numericKey(p.curToken.Literal) {
 				return nil, fmt.Errorf("numeric string keys are forbidden: %q", p.curToken.Literal)
 			}
 		}
@@ -432,4 +432,20 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 	// dotted keys ({a.b = 1}) remain unaffected.
 	p.frozen[reflect.ValueOf(m).Pointer()] = true
 	return m, nil
+}
+
+// Match the package's numeric-key restriction independently of machine word size.
+func numericKey(s string) bool {
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

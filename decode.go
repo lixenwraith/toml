@@ -25,10 +25,20 @@ func Decode(data any, v any) error {
 		return fmt.Errorf("target must be a non-nil pointer")
 	}
 
-	return decodeValue(data, val.Elem())
+	// Decode into a temporary value so errors never partially change the target.
+	tmp := reflect.New(val.Elem().Type()).Elem()
+	tmp.Set(val.Elem())
+	if err := decodeValue(data, tmp, 0); err != nil {
+		return err
+	}
+	val.Elem().Set(tmp)
+	return nil
 }
 
-func decodeValue(data any, val reflect.Value) error {
+func decodeValue(data any, val reflect.Value, depth int) error {
+	if depth > maxValueDepth {
+		return fmt.Errorf("decode nesting exceeds %d", maxValueDepth)
+	}
 	if data == nil {
 		return nil
 	}
@@ -37,7 +47,7 @@ func decodeValue(data any, val reflect.Value) error {
 	case reflect.Ptr:
 		elemType := val.Type().Elem()
 		newVal := reflect.New(elemType)
-		if err := decodeValue(data, newVal.Elem()); err != nil {
+		if err := decodeValue(data, newVal.Elem(), depth+1); err != nil {
 			return err
 		}
 		val.Set(newVal)
@@ -47,7 +57,7 @@ func decodeValue(data any, val reflect.Value) error {
 		if !ok {
 			return fmt.Errorf("expected map for struct, got %T", data)
 		}
-		return decodeStruct(dataMap, val)
+		return decodeStruct(dataMap, val, depth)
 
 	case reflect.Slice:
 		dataSlice, ok := data.([]any)
@@ -64,7 +74,7 @@ func decodeValue(data any, val reflect.Value) error {
 
 		newSlice := reflect.MakeSlice(val.Type(), len(dataSlice), len(dataSlice))
 		for i := 0; i < len(dataSlice); i++ {
-			if err := decodeValue(dataSlice[i], newSlice.Index(i)); err != nil {
+			if err := decodeValue(dataSlice[i], newSlice.Index(i), depth+1); err != nil {
 				return err
 			}
 		}
@@ -82,10 +92,10 @@ func decodeValue(data any, val reflect.Value) error {
 		elemType := val.Type().Elem()
 		for k, vData := range dataMap {
 			newVal := reflect.New(elemType).Elem()
-			if err := decodeValue(vData, newVal); err != nil {
+			if err := decodeValue(vData, newVal, depth+1); err != nil {
 				return fmt.Errorf("map key %s: %w", k, err)
 			}
-			newMap.SetMapIndex(reflect.ValueOf(k), newVal)
+			newMap.SetMapIndex(reflect.ValueOf(k).Convert(val.Type().Key()), newVal)
 		}
 		val.Set(newMap)
 
@@ -109,18 +119,14 @@ func decodeValue(data any, val reflect.Value) error {
 		val.SetInt(i)
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		i, ok := toInt64(data)
+		u, ok := toUint64(data)
 		if !ok {
-			return fmt.Errorf("cannot convert %T to uint", data)
+			return fmt.Errorf("cannot convert %T to uint without loss", data)
 		}
-		if i < 0 {
-			return fmt.Errorf("cannot convert negative value %d to uint", i)
+		if val.OverflowUint(u) {
+			return fmt.Errorf("value %d overflows %s", u, val.Type())
 		}
-		// Overflow check
-		if val.OverflowUint(uint64(i)) {
-			return fmt.Errorf("value %d overflows %s", i, val.Type())
-		}
-		val.SetUint(uint64(i))
+		val.SetUint(u)
 
 	case reflect.Float32, reflect.Float64:
 		f, ok := toFloat(data)
@@ -128,7 +134,7 @@ func decodeValue(data any, val reflect.Value) error {
 			return fmt.Errorf("cannot convert %T to float", data)
 		}
 		// float64 -> float32 range check
-		if val.OverflowFloat(f) {
+		if math.IsNaN(f) || math.IsInf(f, 0) || val.OverflowFloat(f) {
 			return fmt.Errorf("value %g overflows %s", f, val.Type())
 		}
 		val.SetFloat(f)
@@ -155,7 +161,7 @@ func decodeValue(data any, val reflect.Value) error {
 	return nil
 }
 
-func decodeStruct(data map[string]any, val reflect.Value) error {
+func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
 	typ := val.Type()
 
 	for i := 0; i < val.NumField(); i++ {
@@ -174,12 +180,14 @@ func decodeStruct(data map[string]any, val reflect.Value) error {
 			if parts[0] == "-" {
 				continue
 			}
-			key = parts[0]
+			if parts[0] != "" {
+				key = parts[0]
+			}
 		}
 
 		// Look up in data map (case sensitive)
 		if vData, ok := data[key]; ok {
-			if err := decodeValue(vData, field); err != nil {
+			if err := decodeValue(vData, field, depth+1); err != nil {
 				return fmt.Errorf("%s.%s: %w", typ.Name(), fieldType.Name, err)
 			}
 		}
@@ -187,67 +195,53 @@ func decodeStruct(data map[string]any, val reflect.Value) error {
 	return nil
 }
 
-// toInt64 converts numeric types to int64
-func toInt64(v any) (int64, bool) {
-	switch i := v.(type) {
-	case int:
-		return int64(i), true
-	case int8:
-		return int64(i), true
-	case int16:
-		return int64(i), true
-	case int32:
-		return int64(i), true
-	case int64:
-		return i, true
-	case uint:
-		// Reject wrap
-		if uint64(i) > math.MaxInt64 {
+// Numeric conversion uses distinct signed and unsigned paths. Check floats before
+// conversion: converting an out-of-range float to an integer is not portable.
+func toInt64(data any) (int64, bool) {
+	v := reflect.ValueOf(data)
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		u := v.Uint()
+		return int64(u), u <= math.MaxInt64
+	case reflect.Float32, reflect.Float64:
+		f := v.Float()
+		if math.IsNaN(f) || math.Trunc(f) != f || f < -0x1p63 || f >= 0x1p63 {
 			return 0, false
 		}
-	case uint8:
-		return int64(i), true
-	case uint16:
-		return int64(i), true
-	case uint32:
-		return int64(i), true
-	case uint64:
-		// Reject values that wrap negative through int64
-		if i > math.MaxInt64 {
-			return 0, false
-		}
-		return int64(i), true
-	case float64:
-		return int64(i), true
+		return int64(f), true
 	}
 	return 0, false
 }
 
-func toFloat(v any) (float64, bool) {
-	switch i := v.(type) {
-	case int:
-		return float64(i), true
-	case int8:
-		return float64(i), true
-	case int16:
-		return float64(i), true
-	case int32:
-		return float64(i), true
-	case int64:
-		return float64(i), true
-	case uint:
-		return float64(i), true
-	case uint8:
-		return float64(i), true
-	case uint16:
-		return float64(i), true
-	case uint32:
-		return float64(i), true
-	case uint64:
-		return float64(i), true
-	case float64:
-		return i, true
+func toUint64(data any) (uint64, bool) {
+	v := reflect.ValueOf(data)
+	switch v.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return v.Uint(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i := v.Int()
+		return uint64(i), i >= 0
+	case reflect.Float32, reflect.Float64:
+		f := v.Float()
+		if math.IsNaN(f) || math.Trunc(f) != f || f < 0 || f >= 0x1p64 {
+			return 0, false
+		}
+		return uint64(f), true
 	}
 	return 0, false
 }
 
+func toFloat(data any) (float64, bool) {
+	v := reflect.ValueOf(data)
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return float64(v.Int()), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return float64(v.Uint()), true
+	case reflect.Float32, reflect.Float64:
+		return v.Float(), true
+	}
+	return 0, false
+}

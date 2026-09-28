@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -48,7 +48,8 @@ func Marshal(v any) ([]byte, error) {
 }
 
 type encoder struct {
-	w *bytes.Buffer
+	w     *bytes.Buffer
+	depth int
 }
 
 // encodeTable writes the fields of a struct or map.
@@ -57,6 +58,12 @@ type encoder struct {
 // 2. Recurse and write nested tables (structs, maps, arrays of tables).
 // This ensures valid TOML where keys are defined before sub-tables.
 func (e *encoder) encodeTable(rv reflect.Value, prefix string) error {
+	e.depth++
+	defer func() { e.depth-- }()
+	if e.depth > maxValueDepth {
+		return fmt.Errorf("encode nesting exceeds %d (possible cycle)", maxValueDepth)
+	}
+
 	// 1. Gather keys
 	keys, err := e.getSortedKeys(rv)
 	if err != nil {
@@ -113,9 +120,14 @@ func (e *encoder) encodeTable(rv reflect.Value, prefix string) error {
 		keyName := e.getKeyName(rv, k)
 
 		// Determine full path for header
-		fullKey := keyName
+		var keyBuffer bytes.Buffer
+		keyEncoder := encoder{w: &keyBuffer}
+		if err := keyEncoder.writeKey(keyName); err != nil {
+			return err
+		}
+		fullKey := keyBuffer.String()
 		if prefix != "" {
-			fullKey = prefix + "." + keyName
+			fullKey = prefix + "." + fullKey
 		}
 
 		// Handle specific table types
@@ -132,12 +144,13 @@ func (e *encoder) encodeTable(rv reflect.Value, prefix string) error {
 			// [[header]]
 			for i := 0; i < val.Len(); i++ {
 				elem := val.Index(i)
-				// Dereference pointer elements in slice
-				if elem.Kind() == reflect.Ptr {
-					if elem.IsNil() {
-						continue
-					}
-					elem = elem.Elem()
+				var err error
+				elem, err = unwrapValue(elem)
+				if err != nil {
+					return err
+				}
+				if !elem.IsValid() {
+					continue
 				}
 
 				e.w.WriteString("\n")
@@ -154,6 +167,12 @@ func (e *encoder) encodeTable(rv reflect.Value, prefix string) error {
 
 // encodeValue writes a single primitive value or inline array
 func (e *encoder) encodeValue(v reflect.Value) error {
+	e.depth++
+	defer func() { e.depth-- }()
+	if e.depth > maxValueDepth {
+		return fmt.Errorf("encode nesting exceeds %d (possible cycle)", maxValueDepth)
+	}
+
 	switch v.Kind() {
 	case reflect.Bool:
 		if v.Bool() {
@@ -169,6 +188,9 @@ func (e *encoder) encodeValue(v reflect.Value) error {
 		e.w.WriteString(strconv.FormatInt(v.Int(), 10))
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if v.Uint() > math.MaxInt64 {
+			return fmt.Errorf("unsigned value %d exceeds TOML signed 64-bit integer range", v.Uint())
+		}
 		e.w.WriteString(strconv.FormatUint(v.Uint(), 10))
 
 	case reflect.Float32, reflect.Float64:
@@ -203,9 +225,9 @@ func (e *encoder) encodeValue(v reflect.Value) error {
 		}
 		e.w.WriteString("]")
 
-	case reflect.Interface:
+	case reflect.Interface, reflect.Ptr:
 		if v.IsNil() {
-			return nil // Should be handled by caller usually
+			return fmt.Errorf("nil array element has no TOML representation")
 		}
 		return e.encodeValue(v.Elem())
 
@@ -222,6 +244,9 @@ func (e *encoder) getSortedKeys(rv reflect.Value) ([]string, error) {
 	var keys []string
 
 	if rv.Kind() == reflect.Map {
+		if rv.Type().Key().Kind() != reflect.String {
+			return nil, fmt.Errorf("map key must be string, got %s", rv.Type().Key())
+		}
 		for _, key := range rv.MapKeys() {
 			if key.Kind() != reflect.String {
 				return nil, fmt.Errorf("map key must be string, got %v", key.Kind())
@@ -238,16 +263,24 @@ func (e *encoder) getSortedKeys(rv reflect.Value) ([]string, error) {
 			}
 			// Skip if tag is "-"
 			tag := field.Tag.Get("toml")
-			if tag == "-" {
+			if strings.Split(tag, ",")[0] == "-" {
 				continue
 			}
 			keys = append(keys, field.Name)
 		}
 	}
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		name := e.getKeyName(rv, key)
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate field key %q", name)
+		}
+		seen[name] = true
+	}
 	// Sort by emitted key (tag-resolved), not Go field name.
 	// Identity for maps (getKeyName returns the key itself).
-	sort.Slice(keys, func(i, j int) bool {
-		return e.getKeyName(rv, keys[i]) < e.getKeyName(rv, keys[j])
+	slices.SortFunc(keys, func(a, b string) int {
+		return strings.Compare(e.getKeyName(rv, a), e.getKeyName(rv, b))
 	})
 	return keys, nil
 }
@@ -257,7 +290,7 @@ func (e *encoder) getSortedKeys(rv reflect.Value) ([]string, error) {
 func (e *encoder) resolveValue(container reflect.Value, key string) reflect.Value {
 	var val reflect.Value
 	if container.Kind() == reflect.Map {
-		val = container.MapIndex(reflect.ValueOf(key))
+		val = container.MapIndex(reflect.ValueOf(key).Convert(container.Type().Key()))
 	} else {
 		val = container.FieldByName(key)
 	}
@@ -321,11 +354,10 @@ func (e *encoder) shouldSkip(container reflect.Value, realName string, val refle
 // limitation). Nil pointer elements are allowed in table slices and skipped
 // at emission; nil interface elements are an error.
 func (e *encoder) isTable(v reflect.Value) (bool, error) {
-	if v.Kind() == reflect.Interface {
-		v = v.Elem()
-	}
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
+	var err error
+	v, err = unwrapValue(v)
+	if err != nil {
+		return false, err
 	}
 
 	switch v.Kind() {
@@ -382,6 +414,9 @@ func isEmptyValue(v reflect.Value) bool {
 }
 
 func (e *encoder) writeKey(s string) error {
+	if numericKey(s) {
+		return fmt.Errorf("numeric string keys are forbidden: %q", s)
+	}
 	if isBareKey(s) {
 		_, err := e.w.WriteString(s)
 		return err
@@ -459,3 +494,16 @@ func isBareKey(s string) bool {
 	return true
 }
 
+// unwrapValue guards self-referential interface/pointer chains.
+func unwrapValue(v reflect.Value) (reflect.Value, error) {
+	for n := 0; v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr); n++ {
+		if n > maxValueDepth {
+			return reflect.Value{}, fmt.Errorf("cyclic or excessively nested pointer")
+		}
+		if v.IsNil() {
+			return reflect.Value{}, nil
+		}
+		v = v.Elem()
+	}
+	return v, nil
+}

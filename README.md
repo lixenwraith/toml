@@ -2,7 +2,7 @@
 
 Zero-dependency TOML encoder/decoder for Go.
 Implements a practical subset of TOML v1.0 with documented deviations.
-Standard library only.
+Standard library only. Requires Go 1.27.1 or newer.
 
 ## Install
 
@@ -88,9 +88,9 @@ target. `Unmarshal` = `Parse` + `Decode`.
   (`******int` works). Nil maps and slices are materialized.
 - Struct fields match by `toml` tag first, then exact (case-sensitive)
   field name. `toml:"-"` skips. Unexported fields are skipped.
-- Numeric coercion: any parser-produced int/uint/float64 converts to the
-  target numeric kind. Unknown keys in input are ignored.
-- Numeric decode errors on target overflow (`300` → `int8` errors); non-empty interface targets error unless assignable; unsupported target kinds (chan, func, complex, fixed arrays) error; `uint`/`uint64` sources above `MaxInt64` are rejected.
+- Numeric coercion: built-in and named integer/float kinds convert with range
+  checks. Float-to-integer conversion requires a finite, integral, in-range value. Unknown keys in input are ignored.
+- Numeric decode errors on target overflow (`300` → `int8` errors); non-empty interface targets error unless assignable; unsupported target kinds (chan, func, complex, fixed arrays) error; `uint`/`uint64` values use the full unsigned range for unsigned targets and are rejected above `MaxInt64` for signed targets. Non-finite floats are rejected. Decode commits only after success; errors leave the target unchanged.
 
 ### Encoder (`encode.go`)
 
@@ -103,7 +103,8 @@ target. `Unmarshal` = `Parse` + `Decode`.
   re-parses (round-trip safe).
 - `omitempty` honored; nil pointers and `toml:"-"` fields skipped;
   root must be a struct or map.
-- Floats use shortest `'g'` form at the source bit width (large magnitudes emit exponent notation); `NaN`/`±Inf` return an error; arrays mixing tables and scalars return an error (parser accepts them — encode-side limitation); struct keys sort by resolved tag name.
+- Decode and encode bound recursion, returning errors for excessively nested/cyclic values.
+- Floats use shortest `'g'` form at the source bit width (large magnitudes emit exponent notation); `NaN`/`±Inf` return an error; arrays mixing tables and scalars return an error (parser accepts them — encode-side limitation); struct keys sort by resolved tag name. Header segments are quoted separately, including dots/spaces in a key. Unsigned integers above `MaxInt64` cannot be written as TOML integers and return an error; `Decode` itself supports full-range `uint64` data.
 
 ## Type Mapping
 
@@ -152,3 +153,12 @@ Overflow of int64 during parse errors; 32-bit truncation of `int(int64)` is not 
 ## License
 
 BSD-3-Clause (see LICENSE).
+
+## Hardening checks
+
+Run `go test -race ./...` and `go vet ./...`. The regression suite covers signed
+and unsigned boundaries, narrower types, fractional/non-finite conversions,
+transactional decoding, named map keys and nested table round trips. Bounded
+fuzzing: `go test -run '^$' -fuzz '^FuzzNumericDecode$' -fuzztime=10s` (also
+`FuzzParse` and `FuzzRoundTrip`). Integer-to-float conversions use ordinary IEEE
+rounding; choose an integer target when exact integer identity is required.
