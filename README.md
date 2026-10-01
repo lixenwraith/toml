@@ -1,6 +1,6 @@
 # toml
 
-A deterministic TOML subset encoder/decoder using only the standard library.
+A deterministic TOML subset encoder/decoder using Go standard library.
 Requires Go 1.27.1.
 
 ```go
@@ -93,14 +93,6 @@ comment tokens. Stop scanning on `TokenEOF` or `TokenError`.
 - Embedded struct fields are not promoted. Custom marshal interfaces are not
   supported. Decode input containers are the parser's generic maps/slices.
 
-## Migration from the initial version
+## License
 
-Parsed integers now use `int64`, not machine-sized `int`. Update type assertions
-on raw parser results. Typed struct destinations keep their declared types.
-Previously lossy numeric conversions and nil array elements now error. Mixed
-arrays can now be encoded. All changes have regression and fuzz coverage.
-
-Run `go test -race ./...`, `GOARCH=386 go test ./...`, and, for example,
-`go test -run '^$' -fuzz '^FuzzRoundTrip$' -fuzztime=30s`.
-
-BSD-3-Clause; see LICENSE.
+BSD-3-Clause
