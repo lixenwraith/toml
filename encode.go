@@ -109,6 +109,10 @@ func entries(v reflect.Value) ([]entry, error) {
 	return result, nil
 }
 
+// Every header repeats its table's full path, so deep nesting under headers
+// alone grows quadratically; past this length a table is written inline.
+const maxHeaderBytes = 256
+
 func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 	if depth > maxValueDepth {
 		return fmt.Errorf("encode nesting exceeds %d (possible cycle)", maxValueDepth)
@@ -119,11 +123,11 @@ func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 	}
 	var tables []entry
 	for _, x := range fields {
-		if isTable(x.value) || isTableArray(x.value) {
+		key, _ := keyText(x.key)
+		if (isTable(x.value) || isTableArray(x.value)) && len(prefix)+len(key) < maxHeaderBytes {
 			tables = append(tables, x)
 			continue
 		}
-		key, _ := keyText(x.key)
 		e.buf.WriteString(key + " = ")
 		if err := e.value(x.value, depth+1); err != nil {
 			return fmt.Errorf("key %q: %w", x.key, err)

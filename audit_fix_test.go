@@ -1,6 +1,8 @@
 package toml
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -198,5 +200,128 @@ func TestParser_ValueDepthLimit(t *testing.T) {
 	p := NewParser([]byte(input))
 	if _, err := p.Parse(); err == nil {
 		t.Error("expected nesting depth error")
+	}
+}
+
+// Each dotted-key segment and header part is a map; the document's budget of
+// them bounds memory, which input size alone does not (x167 for dotted keys).
+func TestParser_TableBudget(t *testing.T) {
+	doc := []byte("a" + strings.Repeat(".a", 101) + " = 1\n") // 101 maps
+	p := NewParser(doc)
+	p.MaxTables = 100
+	if _, err := p.Parse(); err == nil || !strings.Contains(err.Error(), "exceeds 100 tables") {
+		t.Fatalf("101 tables under a budget of 100: %v", err)
+	}
+	p = NewParser(doc)
+	p.MaxTables = 101
+	if _, err := p.Parse(); err != nil {
+		t.Fatalf("within budget: %v", err)
+	}
+	var b strings.Builder
+	for i := range DefaultMaxTables {
+		fmt.Fprintf(&b, "[t%d]\n", i)
+	}
+	if _, err := NewParser([]byte(b.String() + "[last]\n")).Parse(); err == nil {
+		t.Fatal("the default budget does not hold")
+	}
+}
+
+// TOML 1.1 escapes decode as TOML 1.1 readers decode them
+func TestLexer_TOML11Escapes(t *testing.T) {
+	m, err := NewParser([]byte(`s = "\x61\e\xe9"`)).Parse()
+	if err != nil || m["s"] != "a\x1bé" {
+		t.Fatalf("got %q, %v", m["s"], err)
+	}
+	if _, err := NewParser([]byte(`s = "\x6"`)).Parse(); err == nil {
+		t.Fatal(`\x with one hex digit accepted`)
+	}
+}
+
+// Outside strings a control character can only hide text from a reader: it
+// is refused in comments, and a CR is accepted only as part of CRLF.
+func TestLexer_ControlCharactersOutsideStrings(t *testing.T) {
+	for _, doc := range []string{
+		"a = 1 # see \x1b[8m\nb = 2",
+		"a = 1 # hidden\rb = 2\n",
+		"a = 1\rb = 2\n",
+		"a =\r1\n",
+		"a = 1 # del \x7f\n",
+	} {
+		if _, err := NewParser([]byte(doc)).Parse(); err == nil {
+			t.Errorf("%q accepted", doc)
+		}
+	}
+	m, err := NewParser([]byte("a = 1 # c\t\r\n[t] # d\r\nb = 2\r\n")).Parse()
+	if err != nil || m["a"] != int64(1) {
+		t.Fatalf("CRLF document: %v %v", m, err)
+	}
+}
+
+// The doubled brackets of an array-of-tables header are one delimiter
+func TestParser_ArrayTableDelimitersAdjacent(t *testing.T) {
+	for _, doc := range []string{"[ [a] ]\n", "[[a] ]\n", "[ [a]]\n"} {
+		if _, err := NewParser([]byte(doc)).Parse(); err == nil {
+			t.Errorf("%q accepted as a header", doc)
+		}
+	}
+	for _, doc := range []string{"[[a]]\n", "[ a ]\n", "[[ a ]]\n"} {
+		if _, err := NewParser([]byte(doc)).Parse(); err != nil {
+			t.Errorf("%q: %v", doc, err)
+		}
+	}
+}
+
+// Errors stay small and never carry a string's content, which may be a
+// secret (a verifier in a credentials file)
+func TestErrorsBoundedWithoutStringContent(t *testing.T) {
+	for _, doc := range []string{`stored_key "SECRETVALUE"`, `password = SECRETVALUE`} {
+		_, err := NewParser([]byte(doc + "\n")).Parse()
+		if err == nil || strings.Contains(err.Error(), "SECRET") {
+			t.Fatalf("value content in error: %v", err)
+		}
+	}
+	_, err := NewParser([]byte("n = 1" + strings.Repeat("0", 1<<20) + "\n")).Parse()
+	if err == nil || len(err.Error()) > 200 {
+		t.Fatalf("error of %d bytes", len(err.Error()))
+	}
+}
+
+// A decode error holds its path once, not a copy of the message per level
+func TestDecodeErrorPathIsLinear(t *testing.T) {
+	type deep map[string]deep
+	var data any = "not a table"
+	for range 500 {
+		data = map[string]any{"key": data}
+	}
+	err := Decode(data, new(deep))
+	var total int
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		total += len(e.Error())
+	}
+	if err == nil || total > 3*len(err.Error()) {
+		t.Fatalf("messages along the chain: %d bytes for a %d-byte error", total, len(err.Error()))
+	}
+}
+
+// Header paths are bounded: deep nesting is written inline past the bound,
+// so output stays linear and still round-trips
+func TestMarshal_HeaderLengthBounded(t *testing.T) {
+	root := map[string]any{}
+	cur := root
+	for range 300 {
+		next := map[string]any{"v": int64(1)}
+		cur["long_key_0123"] = next
+		cur = next
+	}
+	out, err := Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) > 64*1024 {
+		t.Fatalf("%d bytes for 300 levels", len(out))
+	}
+	back, err := NewParser(out).Parse()
+	if err != nil || !reflect.DeepEqual(normalize(back), normalize(root)) {
+		t.Fatalf("round trip: %v", err)
 	}
 }

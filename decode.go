@@ -40,6 +40,33 @@ func decodeValue(data any, val reflect.Value) error {
 	return decodeAt(data, val, 0)
 }
 
+// pathError names where decoding failed. Each level adds its segment instead
+// of wrapping the message, which would copy the message once per level.
+type pathError struct {
+	path []string // innermost first
+	err  error
+}
+
+func (e *pathError) Error() string {
+	var b strings.Builder
+	for i := len(e.path) - 1; i >= 0; i-- {
+		b.WriteString(e.path[i])
+		b.WriteString(": ")
+	}
+	b.WriteString(e.err.Error())
+	return b.String()
+}
+
+func (e *pathError) Unwrap() error { return e.err }
+
+func atPath(segment string, err error) error {
+	if pe, ok := err.(*pathError); ok {
+		pe.path = append(pe.path, segment)
+		return pe
+	}
+	return &pathError{path: []string{segment}, err: err}
+}
+
 func decodeAt(data any, val reflect.Value, depth int) error {
 	if depth > maxValueDepth {
 		return fmt.Errorf("decode nesting exceeds %d", maxValueDepth)
@@ -91,7 +118,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		}
 		for i := 0; i < len(dataSlice); i++ {
 			if err := decodeAt(dataSlice[i], newSlice.Index(i), depth+1); err != nil {
-				return fmt.Errorf("index %d: %w", i, err)
+				return atPath(fmt.Sprintf("index %d", i), err)
 			}
 		}
 		val.Set(newSlice)
@@ -109,7 +136,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		for k, vData := range dataMap {
 			newVal := reflect.New(elemType).Elem()
 			if err := decodeAt(vData, newVal, depth+1); err != nil {
-				return fmt.Errorf("map key %s: %w", k, err)
+				return atPath("map key "+brief(k), err)
 			}
 			newMap.SetMapIndex(reflect.ValueOf(k).Convert(val.Type().Key()), newVal)
 		}
@@ -206,7 +233,7 @@ func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
 		// Look up in data map (case sensitive)
 		if vData, ok := data[key]; ok {
 			if err := decodeAt(vData, field, depth+1); err != nil {
-				return fmt.Errorf("%s.%s: %w", typ.Name(), fieldType.Name, err)
+				return atPath(typ.Name()+"."+fieldType.Name, err)
 			}
 		}
 	}

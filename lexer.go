@@ -91,7 +91,7 @@ func (l *Lexer) NextToken() Token {
 	}
 
 	l.advance()
-	return l.newToken(TokenError, fmt.Sprintf("unexpected character: %c", ch))
+	return l.newToken(TokenError, fmt.Sprintf("unexpected character: %q", ch))
 }
 
 func (l *Lexer) readNumber() Token {
@@ -302,10 +302,12 @@ func (l *Lexer) peekAt(n int) rune {
 	return r
 }
 
+// skipWhitespace takes a CR only as part of CRLF: a lone one would let a
+// terminal hide what precedes it on the line, so it lexes as an error.
 func (l *Lexer) skipWhitespace() {
 	for l.pos < len(l.input) {
 		ch := l.peek()
-		if ch == ' ' || ch == '\t' || ch == '\r' {
+		if ch == ' ' || ch == '\t' || ch == '\r' && l.peekAt(1) == '\n' {
 			l.advance()
 		} else {
 			break
@@ -313,10 +315,19 @@ func (l *Lexer) skipWhitespace() {
 	}
 }
 
+// readComment refuses control characters but tab, as TOML does: an ESC or a
+// lone CR in a comment can hide the key after it from a reader.
 func (l *Lexer) readComment() Token {
 	l.advance() // '#'
 	start := l.pos
-	for l.pos < len(l.input) && l.peek() != '\n' {
+	for l.pos < len(l.input) {
+		ch := l.peek()
+		if ch == '\n' || ch == '\r' && l.peekAt(1) == '\n' {
+			break
+		}
+		if ch < 0x20 && ch != '\t' || ch == 0x7f {
+			return l.newToken(TokenError, fmt.Sprintf("control character %q in comment", ch))
+		}
 		l.advance()
 	}
 	return l.newToken(TokenComment, string(l.input[start:l.pos]))
@@ -357,12 +368,17 @@ func (l *Lexer) readString() Token {
 				result = append(result, '\b')
 			case 'f':
 				result = append(result, '\f')
-			case 'u', 'U':
-				n := 4
-				if ch == 'U' {
+			case 'e':
+				result = append(result, 0x1b)
+			case 'x', 'u', 'U':
+				n := 2
+				switch ch {
+				case 'u':
+					n = 4
+				case 'U':
 					n = 8
 				}
-				l.advance() // consume 'u'/'U'
+				l.advance() // consume 'x'/'u'/'U'
 				var code rune
 				for j := 0; j < n; j++ {
 					d, ok := hexDigitVal(l.peek())
@@ -383,7 +399,7 @@ func (l *Lexer) readString() Token {
 				escaped = false
 				continue // hex digits already consumed; skip trailing l.advance()
 			default:
-				// Unknown escape: preserve backslash and full rune
+				// Unknown escape, invalid in every TOML version: preserve backslash and full rune
 				result = append(result, '\\')
 				var buf [utf8.UTFMax]byte
 				n := utf8.EncodeRune(buf[:], ch)
