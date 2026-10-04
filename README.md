@@ -61,11 +61,18 @@ elements error, because TOML has no null value. Nil maps and slices encode as
 empty containers. Duplicate struct tag names error.
 
 Basic-string escapes emitted by the encoder (`\b`, `\f`, `\n`, `\r`, `\t`,
-quotes, backslashes, Unicode escapes) decode symmetrically. Invalid UTF-8 and
-unescaped control characters in strings are rejected. Encoding and typed decoding
+quotes, backslashes, Unicode escapes) decode symmetrically; the TOML 1.1 `\e`
+and `\xHH` decode too. Invalid UTF-8 and unescaped control characters in
+strings are rejected, as are control characters other than tab in comments and
+a carriage return outside CRLF. Encoding and typed decoding
 have recursion bounds (1000 levels), so cyclic traversals fail instead of
 overflowing the stack. Parsing bounds individual value nesting and dotted paths;
-combining paths can still produce trees that exceed the encoder's bound.
+combining paths can still produce trees that exceed the encoder's bound. A
+document may create at most `DefaultMaxTables` (65536) tables, counting every
+dotted-key segment and header part; set `Parser.MaxTables` before `Parse` to
+change it. Errors quote keys and cut long literals, and never repeat a string
+value. `Marshal` writes a table inline once its header path would pass 256
+bytes, so output stays linear in depth.
 
 Comments and original formatting are not preserved by `Parse`/`Marshal`. A
 configuration editor can scan the original bytes with `NewLexer` and retain
@@ -82,9 +89,10 @@ comment tokens. Stop scanning on `TokenEOF` or `TokenError`.
   unsupported.
 - Decimal integer keys (including quoted keys, optional signs and values beyond
   int64) are forbidden. This restriction also applies to the encoder.
-- Unknown string escapes are preserved verbatim as a documented relaxation.
-- Explicit table headers may reopen existing tables. Inline tables cannot be
-  extended later.
+- String escapes invalid in every TOML version are preserved verbatim as a
+  documented relaxation.
+- Explicit table headers may reopen existing tables, and dotted keys may extend
+  a table a header defined. Inline tables cannot be extended later.
 - Inline tables allow newlines and trailing commas. Arrays require commas,
   including between lines. Top-level statements require newline separation.
 - Signed radix integers and uppercase radix prefixes are accepted extensions.

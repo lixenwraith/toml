@@ -46,6 +46,8 @@ func (t Token) String() string {
 		return fmt.Sprintf("Error(%s)", t.Literal)
 	case TokenNewline:
 		return "Newline"
+	case TokenString:
+		return "string" // its content may be a secret, as in a credentials file
 	}
 	if len(t.Literal) > 20 {
 		return fmt.Sprintf("%q...", t.Literal[:20])

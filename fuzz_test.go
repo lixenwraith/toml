@@ -15,6 +15,9 @@ func FuzzParse(f *testing.F) {
 		"t = { a = 1, b = { c = [1, 2] } }",
 		`s = "esc \u00E9 \t"`,
 		"n = -0x10\nb = 0b101\no = 0o17",
+		"e = \"\\e\\x41\"\r\n# c\r\n[[a]]\r\n",
+		"a = 1 # \x1b[8m\nb = 2",
+		"[ [a] ]\nk =\r1",
 	} {
 		f.Add([]byte(s))
 	}

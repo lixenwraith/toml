@@ -1,6 +1,8 @@
 package toml
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -18,10 +20,18 @@ type Parser struct {
 	peekToken Token
 	// Value nesting depth (arrays / inline tables)
 	depth int
+	// Tables (maps) a document may create; 0 means DefaultMaxTables
+	MaxTables int
+	tables    int
 }
 
 // Recursion bound for parseValue -> parseArray/parseInlineTable
 const maxValueDepth = 1000
+
+// DefaultMaxTables bounds the maps one document creates. Every dotted-key
+// segment and header part is a map of about 350 bytes, so without a bound a
+// 10 MiB file of dotted keys holds near 2 GB.
+const DefaultMaxTables = 1 << 16
 
 func NewParser(input []byte) *Parser {
 	l := NewLexer(input)
@@ -34,6 +44,15 @@ func NewParser(input []byte) *Parser {
 	p.nextToken()
 	p.current = p.root
 	return p
+}
+
+// newTable makes a map, counted against the document's table budget
+func (p *Parser) newTable() (map[string]any, error) {
+	p.tables++
+	if limit := cmp.Or(p.MaxTables, DefaultMaxTables); p.tables > limit {
+		return nil, fmt.Errorf("document exceeds %d tables at line %d", limit, p.curToken.Line)
+	}
+	return make(map[string]any), nil
 }
 
 func (p *Parser) nextToken() {
@@ -81,10 +100,11 @@ func (p *Parser) parseStatement() error {
 	}
 }
 
-// parseTableDeclaration handles [key] and [[key]]
+// parseTableDeclaration handles [key] and [[key]]; the doubled brackets of
+// an array of tables are one delimiter, so "[ [a] ]" is no header
 func (p *Parser) parseTableDeclaration() error {
 	isArray := false
-	if p.peekToken.Type == TokenLBracket {
+	if p.peekToken.Type == TokenLBracket && adjacent(p.curToken, p.peekToken) {
 		// It is [[ ...
 		p.nextToken() // consume first [
 		isArray = true
@@ -98,8 +118,8 @@ func (p *Parser) parseTableDeclaration() error {
 	}
 
 	if isArray {
-		if p.curToken.Type != TokenRBracket {
-			return fmt.Errorf("expected closing bracket for array table at line %d", p.curToken.Line)
+		if p.curToken.Type != TokenRBracket || p.peekToken.Type != TokenRBracket || !adjacent(p.curToken, p.peekToken) {
+			return fmt.Errorf("expected ]] closing array table at line %d", p.curToken.Line)
 		}
 		p.nextToken() // consume first ]
 	}
@@ -122,7 +142,7 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 		isLast := i == len(keys)-1
 		currentMap, ok := ptr.(map[string]any)
 		if !ok {
-			return fmt.Errorf("key path conflict: %s is not a map", key)
+			return fmt.Errorf("key path conflict: %q is not a map", key)
 		}
 
 		if isLast {
@@ -133,13 +153,16 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 					if s, ok := val.([]map[string]any); ok {
 						slice = s
 					} else {
-						return fmt.Errorf("key conflict: %s is not an array of tables", key)
+						return fmt.Errorf("key conflict: %q is not an array of tables", key)
 					}
 				} else {
 					slice = make([]map[string]any, 0)
 				}
 
-				newMap := make(map[string]any)
+				newMap, err := p.newTable()
+				if err != nil {
+					return err
+				}
 				slice = append(slice, newMap)
 				currentMap[key] = slice
 				p.current = newMap
@@ -154,10 +177,13 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 						}
 						targetMap = m
 					} else {
-						return fmt.Errorf("key conflict: %s is not a table", key)
+						return fmt.Errorf("key conflict: %q is not a table", key)
 					}
 				} else {
-					targetMap = make(map[string]any)
+					var err error
+					if targetMap, err = p.newTable(); err != nil {
+						return err
+					}
 					currentMap[key] = targetMap
 				}
 				p.current = targetMap
@@ -174,14 +200,17 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 					ptr = m
 				} else if slice, ok := val.([]map[string]any); ok {
 					if len(slice) == 0 {
-						return fmt.Errorf("cannot traverse empty array table %s", key)
+						return fmt.Errorf("cannot traverse empty array table %q", key)
 					}
 					ptr = slice[len(slice)-1]
 				} else {
-					return fmt.Errorf("intermediate key %s is not a map", key)
+					return fmt.Errorf("intermediate key %q is not a map", key)
 				}
 			} else {
-				newMap := make(map[string]any)
+				newMap, err := p.newTable()
+				if err != nil {
+					return err
+				}
 				currentMap[key] = newMap
 				ptr = newMap
 			}
@@ -224,7 +253,7 @@ func (p *Parser) assignValue(scope any, keys []string, val any) error {
 		if i == len(keys)-1 {
 			// Final key, assign value
 			if _, exists := currentMap[key]; exists {
-				return fmt.Errorf("duplicate key %s at line %d", key, p.curToken.Line)
+				return fmt.Errorf("duplicate key %q at line %d", key, p.curToken.Line)
 			}
 			currentMap[key] = val
 		} else {
@@ -236,10 +265,13 @@ func (p *Parser) assignValue(scope any, keys []string, val any) error {
 					}
 					currentMap = m
 				} else {
-					return fmt.Errorf("intermediate key %s is not a map", key)
+					return fmt.Errorf("intermediate key %q is not a map", key)
 				}
 			} else {
-				newMap := make(map[string]any)
+				newMap, err := p.newTable()
+				if err != nil {
+					return err
+				}
 				currentMap[key] = newMap
 				currentMap = newMap
 			}
@@ -253,13 +285,13 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 	for {
 		// Rule: Tokens identified as Numbers are forbidden as keys
 		if p.curToken.Type == TokenInteger || p.curToken.Type == TokenFloat {
-			return nil, fmt.Errorf("numeric keys are forbidden: %q", p.curToken.Literal)
+			return nil, fmt.Errorf("numeric keys are forbidden: %s", brief(p.curToken.Literal))
 		}
 
 		if p.curToken.Type == TokenString {
 			// Rule: Even quoted strings shouldn't be pure numbers per instruction
 			if numericKey(p.curToken.Literal) {
-				return nil, fmt.Errorf("numeric string keys are forbidden: %q", p.curToken.Literal)
+				return nil, fmt.Errorf("numeric string keys are forbidden: %s", brief(p.curToken.Literal))
 			}
 		}
 
@@ -298,14 +330,14 @@ func (p *Parser) parseValue() (any, error) {
 	case TokenInteger:
 		val, err := p.parseInteger(p.curToken.Literal)
 		if err != nil {
-			return nil, fmt.Errorf("invalid integer %q at line %d: %w", p.curToken.Literal, p.curToken.Line, err)
+			return nil, fmt.Errorf("invalid integer %s at line %d: %w", brief(p.curToken.Literal), p.curToken.Line, numCause(err))
 		}
 		p.nextToken()
 		return val, nil
 	case TokenFloat:
 		val, err := strconv.ParseFloat(p.curToken.Literal, 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid float %q at line %d: %w", p.curToken.Literal, p.curToken.Line, err)
+			return nil, fmt.Errorf("invalid float %s at line %d: %w", brief(p.curToken.Literal), p.curToken.Line, numCause(err))
 		}
 		p.nextToken()
 		return val, nil
@@ -317,6 +349,10 @@ func (p *Parser) parseValue() (any, error) {
 		return p.parseArray()
 	case TokenLBrace:
 		return p.parseInlineTable()
+	}
+	if p.curToken.Type == TokenIdent {
+		// An unquoted value may be a secret: say what it is, not what it says
+		return nil, fmt.Errorf("unquoted value at line %d: strings need quotes", p.curToken.Line)
 	}
 	return nil, fmt.Errorf("unexpected value token %s at line %d", p.curToken.String(), p.curToken.Line)
 }
@@ -386,7 +422,10 @@ func (p *Parser) parseArray() ([]any, error) {
 
 func (p *Parser) parseInlineTable() (map[string]any, error) {
 	p.nextToken() // consume {
-	m := make(map[string]any)
+	m, err := p.newTable()
+	if err != nil {
+		return nil, err
+	}
 
 	for p.curToken.Type != TokenRBrace {
 		if p.curToken.Type == TokenNewline {
@@ -432,6 +471,25 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 	// dotted keys ({a.b = 1}) remain unaffected.
 	p.frozen[reflect.ValueOf(m).Pointer()] = true
 	return m, nil
+}
+
+// adjacent reports b starting right after the one-byte token a
+func adjacent(a, b Token) bool { return a.Line == b.Line && b.Col == a.Col+1 }
+
+// brief quotes s for an error, cut to 32 bytes: a literal can be megabytes
+func brief(s string) string {
+	if len(s) > 32 {
+		return fmt.Sprintf("%q... (%d bytes)", s[:32], len(s))
+	}
+	return fmt.Sprintf("%q", s)
+}
+
+// numCause drops strconv's copy of the literal, which brief already shows
+func numCause(err error) error {
+	if ne, ok := errors.AsType[*strconv.NumError](err); ok {
+		return ne.Err
+	}
+	return err
 }
 
 func signPrefix(negative bool) string {
