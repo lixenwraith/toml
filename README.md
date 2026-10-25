@@ -1,6 +1,6 @@
 # toml
 
-A deterministic TOML subset encoder/decoder using Go standard library.
+A deterministic TOML subset encoder, decoder and formatter using Go standard library.
 Requires Go 1.27.1.
 
 ```go
@@ -62,7 +62,8 @@ empty containers. Duplicate struct tag names error.
 
 Basic-string escapes emitted by the encoder (`\b`, `\f`, `\n`, `\r`, `\t`,
 quotes, backslashes, Unicode escapes) decode symmetrically; the TOML 1.1 `\e`
-and `\xHH` decode too. Invalid UTF-8 and unescaped control characters in
+and `\xHH` decode too. The encoder escapes the runes that can hide text, as
+`Format` does (below). Invalid UTF-8 and unescaped control characters in
 strings are rejected, as are control characters other than tab in comments and
 a carriage return outside CRLF. Encoding and typed decoding
 have recursion bounds (1000 levels), so cyclic traversals fail instead of
@@ -74,8 +75,11 @@ change it. Errors quote keys and cut long literals, and never repeat a string
 value. `Marshal` writes a table inline once its header path would pass 256
 bytes, so output stays linear in depth.
 
+`Marshal` writes an inline table as `{ a = 1 }` and a blank line above each
+header but one opening the document; its output is what `Format` writes for it.
 Comments and original formatting are not preserved by `Parse`/`Marshal`; a
-`Document` edits a file in place instead.
+`Document` edits a file in place, and `Format` rewrites one with its comments
+kept.
 
 ## Editing a document in place
 
@@ -98,8 +102,9 @@ A group of comment lines belongs to whichever side fewer blank lines part it
 from, the side below on a tie: the statement right under it, or the run of
 statements (lines no blank line parts) above or below it. The file's start and
 end count as sides, so a comment at the top with a blank line under it, or at
-the end with one above it, belongs to the file and stays. Between two runs,
-several groups split at the widest gap.
+the end with one above it, belongs to the file and stays, while one touching
+the last statement is that statement's run's. Between two runs, several groups
+split at the widest gap.
 
 - `Set` replaces the value of a key the document sets, keeping the rest of its
   line and its comment. A key it lacks goes after the last key of its table,
@@ -121,6 +126,46 @@ several groups split at the widest gap.
   document would, quoting segments that need it.
 
 A token's `Pos` and `End` are its byte offsets in the input.
+
+## Formatting
+
+```go
+out, err := toml.Format(data)
+out, err = toml.Formatter{Indent: "  ", IndentTables: true, Align: true}.Format(data)
+```
+
+`Format` writes a document spaced as `Marshal` writes one: one space around `=`
+and after a comma, `[1, 2]`, `{ a = 1 }`, `[a.b]`, LF line ends. A value's lines
+go a level deeper than the line its opening bracket is on, and an array or
+inline table has a trailing comma exactly when its closing bracket has a line of
+its own. Keys, scalars and comments keep their spelling; a run of blank lines
+becomes one.
+
+Every comment stays with what it belongs to, as a `Document` reads it, and the
+result's blank lines say so again: two blank lines follow a group of comments
+that belongs to what is above it, after a blank line. Each table is written
+once, at its first header. The keys of a header opening a table again go there,
+a blank line apart, the header's comments above them; a dotted key reaching a
+table that has a header moves into it, spelled from it, with its own comments.
+Tables of an array of tables stay as written.
+
+- `Indent` is one level, up to 8 tabs or spaces; a tab when empty.
+- `IndentTables` puts a table a level deeper for each table it is under whose
+  header comes before it: `[a.b]` after `[a]`.
+- `Align` lines up the `=` and the comments of keys on consecutive lines, with
+  spaces. A comment or blank line, a value of several lines, a key over 32 runes
+  or a line over 80 ends the run.
+
+A line indents no deeper than 16 levels, so a result stays within a fixed
+multiple of its source. `Format` refuses what `Parse` refuses, and a comment
+holding a bidirectional embedding, override or isolate (U+202A to U+202E, U+2066
+to U+2069) or a line break other than LF (U+0085, U+2028, U+2029): such a rune
+can show a reader text other than what parses, and a comment has no escape for
+it. In a string or quoted key it is written as its `\u` escape. A result that
+would not parse to the same values is refused.
+
+`Parse`, `Unmarshal` and `Decode` never format: they skip a comment without
+reading its text.
 
 ## Deliberate subset and deviations
 

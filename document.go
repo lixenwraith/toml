@@ -312,12 +312,11 @@ func unmapped(data any, t reflect.Type, at Key, seen map[string]Key, depth int) 
 	}
 }
 
-// Delete removes key and every key under it: each statement setting one and each
-// table header naming one, in every table of an array of tables, with the comments
-// that are theirs. A run of statements that goes whole takes the comments around
-// it and one of the blank runs beside it; every other line is kept. It reports
-// whether anything was removed; a key inside an inline value, a table or array
-// written as a value, cannot be edited and fails.
+// Delete removes key and every key under it, each statement setting one and each
+// header naming one, in every table of an array of tables, with the comments that
+// are theirs; a run of statements going whole takes its comments and one blank run
+// beside it. It reports whether anything was removed; a key inside an inline value,
+// a table or array written as a value, cannot be edited and fails.
 func (d *Document) Delete(key Key) (bool, error) {
 	gone := make([]bool, len(d.stmts))
 	some := false
@@ -371,13 +370,11 @@ func (d *Document) inline(s statement) bool {
 	return c == '{' || c == '['
 }
 
-// Set gives key the value v, encoded as Marshal writes a value. A key the document
-// sets has its value replaced, the rest of its line kept; a key it lacks goes after
-// the last key of its table, else after the table's header, else in a table
-// appended to the document, before the comments closing it. A root key with no
-// other goes above the first table and its comments. A key under an array of
-// tables or inside an inline value fails, and so does a value the document then
-// would not parse with.
+// Set gives key the value v, encoded as Marshal writes one. A key the document sets
+// has its value replaced, the rest of its line kept; one it lacks goes after the
+// last key of its table, else after its header, else in a table appended above the
+// file's closing comments, a first root key above the first table and its comments.
+// A key under an array of tables or an inline value fails, as does an unparsable edit.
 func (d *Document) Set(key Key, v any) error {
 	if len(key) == 0 || v == nil {
 		return fmt.Errorf("a key and a value are needed")

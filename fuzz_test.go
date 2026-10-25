@@ -1,6 +1,7 @@
 package toml
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -86,6 +87,10 @@ func FuzzRoundTrip(f *testing.F) {
 		}
 		if !reflect.DeepEqual(normalize(m1), normalize(m2)) {
 			t.Fatalf("fixpoint violation:\nm1: %#v\nm2: %#v\nemitted:\n%s", m1, m2, out)
+		}
+		// Marshal lays a document out as Format does
+		if f, err := Format(out); err != nil || !bytes.Equal(f, out) {
+			t.Fatalf("Format rewrites Marshal's output (%v):\n%s\nto:\n%s", err, out, f)
 		}
 	})
 }

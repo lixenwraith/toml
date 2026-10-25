@@ -11,11 +11,11 @@ import (
 	"unicode/utf8"
 )
 
-// Marshal encodes a struct or string-keyed map with deterministic key order.
-// Nil pointer/interface fields are omitted; nil pointer/interface array elements,
-// cycles/excessive nesting,
-// non-finite floats, and integers outside TOML's signed 64-bit range error.
-// Comments and whitespace are not retained. Datetimes are not supported.
+// Marshal encodes a struct or string-keyed map with deterministic key order, laid
+// out as Format lays it. Nil pointer/interface fields are omitted; nil
+// pointer/interface array elements, cycles/excessive nesting, non-finite floats,
+// and integers outside TOML's signed 64-bit range error. Datetimes are not
+// supported.
 func Marshal(v any) ([]byte, error) {
 	var e encoder
 	if err := e.table(reflect.ValueOf(v), "", 0); err != nil {
@@ -148,8 +148,11 @@ func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 	return nil
 }
 
+// header writes a table's header a blank line below what is above it
 func (e *encoder) header(key, open, close string) {
-	e.buf.WriteString("\n")
+	if e.buf.Len() > 0 {
+		e.buf.WriteString("\n")
+	}
 	e.buf.WriteString(open)
 	e.buf.WriteString(key)
 	e.buf.WriteString(close)
@@ -225,13 +228,17 @@ func (e *encoder) value(v reflect.Value, depth int) error {
 		e.buf.WriteByte('{')
 		for i, x := range fields {
 			if i > 0 {
-				e.buf.WriteString(", ")
+				e.buf.WriteByte(',')
 			}
+			e.buf.WriteByte(' ')
 			e.buf.WriteString(x.key)
 			e.buf.WriteString(" = ")
 			if err := e.value(x.value, depth+1); err != nil {
 				return err
 			}
+		}
+		if len(fields) > 0 {
+			e.buf.WriteByte(' ')
 		}
 		e.buf.WriteByte('}')
 	default:
@@ -274,7 +281,7 @@ func (e *encoder) string(s string) {
 		case '\f':
 			e.buf.WriteString(`\f`)
 		default:
-			if r < 0x20 || r == 0x7f {
+			if r < 0x20 || r == 0x7f || hides(r) {
 				fmt.Fprintf(&e.buf, `\u%04X`, r)
 			} else {
 				e.buf.WriteRune(r)

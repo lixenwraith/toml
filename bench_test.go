@@ -156,6 +156,17 @@ func BenchmarkMarshal(b *testing.B) {
 	}
 }
 
+func BenchmarkFormat(b *testing.B) {
+	data := scenarioDoc(64)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := Format(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkParseDocument(b *testing.B) {
 	data := []byte(benchSettings)
 	b.SetBytes(int64(len(data)))
