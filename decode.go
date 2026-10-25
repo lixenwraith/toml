@@ -1,10 +1,12 @@
 package toml
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 // Unmarshal parses TOML data and stores the result in the value pointed to by v.
@@ -132,13 +134,16 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 			return fmt.Errorf("expected map, got %T", data)
 		}
 		newMap := reflect.MakeMapWithSize(val.Type(), len(dataMap))
-		elemType := val.Type().Elem()
+		// One key and one element, zeroed per entry, which SetMapIndex copies
+		key := reflect.New(val.Type().Key()).Elem()
+		elem := reflect.New(val.Type().Elem()).Elem()
 		for k, vData := range dataMap {
-			newVal := reflect.New(elemType).Elem()
-			if err := decodeAt(vData, newVal, depth+1); err != nil {
+			elem.SetZero()
+			if err := decodeAt(vData, elem, depth+1); err != nil {
 				return atPath("map key "+brief(k), err)
 			}
-			newMap.SetMapIndex(reflect.ValueOf(k).Convert(val.Type().Key()), newVal)
+			key.SetString(k)
+			newMap.SetMapIndex(key, elem)
 		}
 		val.Set(newMap)
 
@@ -207,37 +212,48 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 }
 
 func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
-	typ := val.Type()
-
-	for i := 0; i < val.NumField(); i++ {
-		field := val.Field(i)
-		fieldType := typ.Field(i)
-
-		// Safety check: skip unexported fields that cannot be set
-		if !field.CanSet() {
-			continue
-		}
-
-		// Determine key name
-		key := fieldType.Name
-		if tag := fieldType.Tag.Get("toml"); tag != "" {
-			parts := strings.Split(tag, ",")
-			if parts[0] == "-" {
-				continue
-			}
-			if parts[0] != "" {
-				key = parts[0]
-			}
-		}
-
+	for _, f := range fieldsOf(val.Type()) {
 		// Look up in data map (case sensitive)
-		if vData, ok := data[key]; ok {
-			if err := decodeAt(vData, field, depth+1); err != nil {
-				return atPath(typ.Name()+"."+fieldType.Name, err)
+		if vData, ok := data[f.key]; ok {
+			if err := decodeAt(vData, val.Field(f.index), depth+1); err != nil {
+				return atPath(val.Type().Name()+"."+f.name, err)
 			}
 		}
 	}
 	return nil
+}
+
+// field is a struct field a document can set: exported and not tagged "-"
+type field struct {
+	index     int
+	key       string // the tag's name, else the Go name
+	name      string // the Go name
+	omitempty bool
+}
+
+var fieldCache sync.Map // reflect.Type -> []field
+
+// fieldsOf lists the fields of struct type t a document names, in declaration
+// order; read once per type, as the tags never change
+func fieldsOf(t reflect.Type) []field {
+	if f, ok := fieldCache.Load(t); ok {
+		return f.([]field)
+	}
+	out := make([]field, 0, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name, opts, _ := strings.Cut(f.Tag.Get("toml"), ",")
+		if !f.IsExported() || name == "-" {
+			continue
+		}
+		x := field{index: i, key: cmp.Or(name, f.Name), name: f.Name}
+		for o := range strings.SplitSeq(opts, ",") {
+			x.omitempty = x.omitempty || o == "omitempty"
+		}
+		out = append(out, x)
+	}
+	f, _ := fieldCache.LoadOrStore(t, out)
+	return f.([]field)
 }
 
 // Numeric conversions check before conversion: rounded float64(MaxInt64) is

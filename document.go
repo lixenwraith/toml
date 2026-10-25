@@ -2,7 +2,6 @@ package toml
 
 import (
 	"bytes"
-	"cmp"
 	"fmt"
 	"reflect"
 	"slices"
@@ -174,13 +173,9 @@ func unmapped(data any, t reflect.Type, at Key, seen map[string]Key, depth int) 
 		if !ok {
 			return
 		}
-		fields := make(map[string]reflect.Type, t.NumField())
-		for i := range t.NumField() {
-			f := t.Field(i)
-			name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
-			if f.IsExported() && name != "-" {
-				fields[cmp.Or(name, f.Name)] = f.Type
-			}
+		fields := make(map[string]reflect.Type)
+		for _, f := range fieldsOf(t) {
+			fields[f.key] = t.Field(f.index).Type
 		}
 		for k, v := range m {
 			key := append(slices.Clip(at), k)
