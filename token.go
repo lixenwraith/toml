@@ -30,12 +30,13 @@ const (
 	TokenNewline  // \n
 )
 
-// Token represents a lexical token
+// Token represents a lexical token; Pos and End are its byte offsets in the input
 type Token struct {
-	Type    TokenType
-	Literal string
-	Line    int
-	Col     int
+	Type     TokenType
+	Literal  string
+	Line     int
+	Col      int
+	Pos, End int
 }
 
 func (t Token) String() string {

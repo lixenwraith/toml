@@ -74,12 +74,42 @@ change it. Errors quote keys and cut long literals, and never repeat a string
 value. `Marshal` writes a table inline once its header path would pass 256
 bytes, so output stays linear in depth.
 
-Comments and original formatting are not preserved by `Parse`/`Marshal`. A
-configuration editor can scan the original bytes with `NewLexer` and retain
-`TokenComment.Literal` values, then prefix each with `#` and write them as a
-preamble before the marshaled data. This preserves comment text (including
-inline comments), but not its original location. Hashes inside strings are not
-comment tokens. Stop scanning on `TokenEOF` or `TokenError`.
+Comments and original formatting are not preserved by `Parse`/`Marshal`; a
+`Document` edits a file in place instead.
+
+## Editing a document in place
+
+```go
+doc, err := toml.ParseDocument(data)
+err = doc.Decode(&settings)
+unknown := doc.Unmapped(&settings)         // []toml.Key no field takes
+removed, err := doc.Delete(toml.Key{"play", "effects"})
+err = doc.Set(toml.Key{"play", "sfx"}, false)
+data = doc.Bytes()
+```
+
+`ParseDocument` parses as `Parse` does and keeps the bytes. An edit rewrites only
+the statements it names, so comments, blank lines, order and the spelling of
+every other value stay as written; the result is parsed again, and an edit it
+would not parse after is refused with the document unchanged.
+
+- `Set` replaces the value of a key the document sets, keeping the rest of its
+  line and its comment. A key it lacks goes after the last key of its table,
+  spelled as that key is (`play.mouse` beside `play.hud`), else after the table's
+  header, else in a `[table]` appended at the end. A key under an array of
+  tables, inside an inline table or array, or naming a table fails. The value is
+  encoded as `Marshal` writes one.
+- `Delete` removes the key and every key under it: each statement setting one and
+  each header naming one, in every table of an array of tables. It reports
+  whether it removed anything; a key inside an inline value fails.
+- `Unmapped` names the keys no field of the destination takes, matched as `Decode`
+  matches them (tags, then field names; unexported and `-` fields take nothing),
+  each once and sorted. A map or interface destination takes every key under it;
+  a key under an array of tables is named without its index.
+- `Key` is a dotted path, one segment per part; `Key.String` spells it as a
+  document would, quoting segments that need it.
+
+A token's `Pos` and `End` are its byte offsets in the input.
 
 ## Deliberate subset and deviations
 
