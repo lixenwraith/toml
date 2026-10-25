@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"unicode/utf8"
 )
@@ -12,10 +13,13 @@ import (
 // Parser parses TOML tokens into a map[string]any
 type Parser struct {
 	root    map[string]any
-	lexer   *Lexer
-	current any // Pointer to the current map or slice of maps being populated (scope)
-	// Identity set of inline-table maps (immutable per TOML spec)
-	frozen    map[uintptr]bool
+	lexer   Lexer
+	current map[string]any // the table keys are assigned to
+	// Inline tables a key's value made, immutable per TOML spec: a few in place,
+	// a set past them. One in an array no key can reach, so it is not held.
+	frozen    [4]uintptr
+	nfrozen   int
+	frozenSet map[uintptr]bool
 	curToken  Token
 	peekToken Token
 	// Value nesting depth (arrays / inline tables)
@@ -23,6 +27,9 @@ type Parser struct {
 	// Tables (maps) a document may create; 0 means DefaultMaxTables
 	MaxTables int
 	tables    int
+	// Elements of the arrays being parsed, an inner array's above its parent's,
+	// so each array is one allocation of its final length
+	values []any
 }
 
 // Recursion bound for parseValue -> parseArray/parseInlineTable
@@ -34,15 +41,10 @@ const maxValueDepth = 1000
 const DefaultMaxTables = 1 << 16
 
 func NewParser(input []byte) *Parser {
-	l := NewLexer(input)
-	p := &Parser{
-		lexer:  l,
-		root:   make(map[string]any),
-		frozen: make(map[uintptr]bool),
-	}
-	p.nextToken()
-	p.nextToken()
+	p := &Parser{lexer: Lexer{input: input, line: 1, lean: true}, root: make(map[string]any)}
 	p.current = p.root
+	p.nextToken()
+	p.nextToken()
 	return p
 }
 
@@ -96,7 +98,7 @@ func (p *Parser) parseStatement() error {
 	case TokenError:
 		return fmt.Errorf("lexing error line %d: %s", p.curToken.Line, p.curToken.Literal)
 	default:
-		return fmt.Errorf("unexpected token line %d: %s", p.curToken.Line, p.curToken.String())
+		return fmt.Errorf("unexpected token line %d: %s", p.curToken.Line, p.show(p.curToken))
 	}
 }
 
@@ -112,7 +114,8 @@ func (p *Parser) parseTableDeclaration() error {
 	p.nextToken() // consume [
 
 	// Parse Key (dotted)
-	keys, err := p.parseKeyParts()
+	var buf [4]string
+	keys, err := p.parseKeyParts(buf[:0])
 	if err != nil {
 		return err
 	}
@@ -172,7 +175,7 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 				if val, exists := currentMap[key]; exists {
 					if m, ok := val.(map[string]any); ok {
 						// Inline tables cannot be reopened
-						if p.frozen[reflect.ValueOf(m).Pointer()] {
+						if p.isFrozen(m) {
 							return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
 						}
 						targetMap = m
@@ -194,7 +197,7 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 			if val, exists := currentMap[key]; exists {
 				if m, ok := val.(map[string]any); ok {
 					// Inline tables cannot be extended via sub-tables
-					if p.frozen[reflect.ValueOf(m).Pointer()] {
+					if p.isFrozen(m) {
 						return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
 					}
 					ptr = m
@@ -219,15 +222,16 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 	return nil
 }
 
-func (p *Parser) parseKeyValuePair(scope any) error {
+func (p *Parser) parseKeyValuePair(scope map[string]any) error {
 	// Parse Key (dotted allowed: a.b.c = 1)
-	keys, err := p.parseKeyParts()
+	var buf [4]string
+	keys, err := p.parseKeyParts(buf[:0])
 	if err != nil {
 		return err
 	}
 
 	if p.curToken.Type != TokenEqual {
-		return fmt.Errorf("expected '=' after key at line %d, got %s", p.curToken.Line, p.curToken.String())
+		return fmt.Errorf("expected '=' after key at line %d, got %s", p.curToken.Line, p.show(p.curToken))
 	}
 	p.nextToken() // consume =
 
@@ -235,20 +239,12 @@ func (p *Parser) parseKeyValuePair(scope any) error {
 	if err != nil {
 		return err
 	}
-
-	// Assign value to scope
 	return p.assignValue(scope, keys, val)
 }
 
-func (p *Parser) assignValue(scope any, keys []string, val any) error {
-	ptr := scope
-
-	// If scope is map, easy. If scope is not map, error.
-	currentMap, ok := ptr.(map[string]any)
-	if !ok {
-		return fmt.Errorf("scope is not a map")
-	}
-
+// assignValue sets keys under scope to val, freezing val if it is an inline table
+func (p *Parser) assignValue(scope map[string]any, keys []string, val any) error {
+	currentMap := scope
 	for i, key := range keys {
 		if i == len(keys)-1 {
 			// Final key, assign value
@@ -256,11 +252,14 @@ func (p *Parser) assignValue(scope any, keys []string, val any) error {
 				return fmt.Errorf("duplicate key %q at line %d", key, p.curToken.Line)
 			}
 			currentMap[key] = val
+			if m, ok := val.(map[string]any); ok {
+				p.freeze(m)
+			}
 		} else {
 			// Intermediate, ensure map
 			if existing, exists := currentMap[key]; exists {
 				if m, ok := existing.(map[string]any); ok {
-					if p.frozen[reflect.ValueOf(m).Pointer()] {
+					if p.isFrozen(m) {
 						return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
 					}
 					currentMap = m
@@ -280,12 +279,38 @@ func (p *Parser) assignValue(scope any, keys []string, val any) error {
 	return nil
 }
 
-func (p *Parser) parseKeyParts() ([]string, error) {
-	var keys []string
+// freeze marks an inline table no later key may extend
+func (p *Parser) freeze(m map[string]any) {
+	k := reflect.ValueOf(m).Pointer()
+	if p.frozenSet == nil && p.nfrozen < len(p.frozen) {
+		p.frozen[p.nfrozen] = k
+		p.nfrozen++
+		return
+	}
+	if p.frozenSet == nil {
+		p.frozenSet = make(map[uintptr]bool)
+		for _, f := range p.frozen {
+			p.frozenSet[f] = true
+		}
+	}
+	p.frozenSet[k] = true
+}
+
+func (p *Parser) isFrozen(m map[string]any) bool {
+	k := reflect.ValueOf(m).Pointer()
+	if p.frozenSet != nil {
+		return p.frozenSet[k]
+	}
+	return slices.Contains(p.frozen[:p.nfrozen], k)
+}
+
+// parseKeyParts appends a dotted key's parts to keys, which callers keep on
+// their stack
+func (p *Parser) parseKeyParts(keys []string) ([]string, error) {
 	for {
 		// Rule: Tokens identified as Numbers are forbidden as keys
 		if p.curToken.Type == TokenInteger || p.curToken.Type == TokenFloat {
-			return nil, fmt.Errorf("numeric keys are forbidden: %s", brief(p.curToken.Literal))
+			return nil, fmt.Errorf("numeric keys are forbidden: %s", brief(string(p.lexer.input[p.curToken.Pos:p.curToken.End])))
 		}
 
 		if p.curToken.Type == TokenString {
@@ -296,7 +321,7 @@ func (p *Parser) parseKeyParts() ([]string, error) {
 		}
 
 		if p.curToken.Type != TokenIdent && p.curToken.Type != TokenString {
-			return nil, fmt.Errorf("expected key, got %s", p.curToken.String())
+			return nil, fmt.Errorf("expected key, got %s", p.show(p.curToken))
 		}
 
 		if len(keys) >= maxValueDepth {
@@ -328,16 +353,18 @@ func (p *Parser) parseValue() (any, error) {
 		p.nextToken()
 		return val, nil
 	case TokenInteger:
-		val, err := p.parseInteger(p.curToken.Literal)
+		lit := p.lexer.input[p.curToken.Pos:p.curToken.End]
+		val, err := parseInteger(lit)
 		if err != nil {
-			return nil, fmt.Errorf("invalid integer %s at line %d: %w", brief(p.curToken.Literal), p.curToken.Line, numCause(err))
+			return nil, fmt.Errorf("invalid integer %s at line %d: %w", brief(string(lit)), p.curToken.Line, numCause(err))
 		}
 		p.nextToken()
 		return val, nil
 	case TokenFloat:
-		val, err := strconv.ParseFloat(p.curToken.Literal, 64)
+		lit := p.lexer.input[p.curToken.Pos:p.curToken.End]
+		val, err := strconv.ParseFloat(string(lit), 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid float %s at line %d: %w", brief(p.curToken.Literal), p.curToken.Line, numCause(err))
+			return nil, fmt.Errorf("invalid float %s at line %d: %w", brief(string(lit)), p.curToken.Line, numCause(err))
 		}
 		p.nextToken()
 		return val, nil
@@ -354,46 +381,28 @@ func (p *Parser) parseValue() (any, error) {
 		// An unquoted value may be a secret: say what it is, not what it says
 		return nil, fmt.Errorf("unquoted value at line %d: strings need quotes", p.curToken.Line)
 	}
-	return nil, fmt.Errorf("unexpected value token %s at line %d", p.curToken.String(), p.curToken.Line)
+	return nil, fmt.Errorf("unexpected value token %s at line %d", p.show(p.curToken), p.curToken.Line)
 }
 
-func (p *Parser) parseInteger(lit string) (int64, error) {
-	// Handle optional leading sign
-	negative := false
-	numLit := lit
-	if len(numLit) > 0 && (numLit[0] == '+' || numLit[0] == '-') {
-		negative = numLit[0] == '-'
-		numLit = numLit[1:]
+// parseInteger reads a lexed integer: a prefixed one as strconv's base 0 does, the
+// rest in base 10, so a leading zero is not octal. Neither keeps lit.
+func parseInteger(lit []byte) (int64, error) {
+	digits := lit
+	if len(digits) > 0 && (digits[0] == '+' || digits[0] == '-') {
+		digits = digits[1:]
 	}
-
-	var val int64
-	var err error
-
-	if len(numLit) > 2 && numLit[0] == '0' {
-		switch numLit[1] {
-		case 'x', 'X':
-			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 16, 64)
-		case 'o', 'O':
-			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 8, 64)
-		case 'b', 'B':
-			val, err = strconv.ParseInt(signPrefix(negative)+numLit[2:], 2, 64)
-		default:
-			val, err = strconv.ParseInt(lit, 10, 64)
-			return val, err
-		}
-		if err != nil {
-			return 0, err
-		}
-		return val, nil
+	if len(digits) > 2 && digits[0] == '0' && !isDigit(rune(digits[1])) {
+		return strconv.ParseInt(string(lit), 0, 64)
 	}
-
-	val, err = strconv.ParseInt(lit, 10, 64)
-	return val, err
+	return strconv.ParseInt(string(lit), 10, 64)
 }
 
 func (p *Parser) parseArray() ([]any, error) {
 	p.nextToken() // consume [
-	arr := make([]any, 0)
+	base := len(p.values)
+	if p.values == nil {
+		p.values = make([]any, 0, 8)
+	}
 
 	for p.curToken.Type != TokenRBracket {
 		if p.curToken.Type == TokenNewline {
@@ -405,7 +414,7 @@ func (p *Parser) parseArray() ([]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		arr = append(arr, val)
+		p.values = append(p.values, val)
 
 		for p.curToken.Type == TokenNewline {
 			p.nextToken()
@@ -417,6 +426,10 @@ func (p *Parser) parseArray() ([]any, error) {
 		}
 	}
 	p.nextToken() // consume ]
+	arr := make([]any, len(p.values)-base)
+	copy(arr, p.values[base:])
+	clear(p.values[base:])
+	p.values = p.values[:base]
 	return arr, nil
 }
 
@@ -434,7 +447,8 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 		}
 
 		// Parse key = value
-		keys, err := p.parseKeyParts()
+		var buf [4]string
+		keys, err := p.parseKeyParts(buf[:0])
 		if err != nil {
 			return nil, err
 		}
@@ -464,17 +478,22 @@ func (p *Parser) parseInlineTable() (map[string]any, error) {
 		}
 	}
 	p.nextToken() // consume }
-
-	// Mark inline table immutable. Value.Pointer for maps is documented
-	// stable for identity comparison. Nested inline tables self-mark on return;
-	// same-table dotted assignments happen before the mark, so intra-table
-	// dotted keys ({a.b = 1}) remain unaffected.
-	p.frozen[reflect.ValueOf(m).Pointer()] = true
+	// The key this is the value of freezes it (assignValue), after the dotted
+	// keys inside it ({a.b = 1}) built it
 	return m, nil
 }
 
-// adjacent reports b starting right after the one-byte token a
-func adjacent(a, b Token) bool { return a.Line == b.Line && b.Col == a.Col+1 }
+// show is t as an error names it; a number's text, which the lexer leaves out,
+// read back from the input
+func (p *Parser) show(t Token) string {
+	if t.Type == TokenInteger || t.Type == TokenFloat {
+		t.Literal = string(p.lexer.input[t.Pos:t.End])
+	}
+	return t.String()
+}
+
+// adjacent reports b starting where a ends
+func adjacent(a, b Token) bool { return b.Pos == a.End }
 
 // brief quotes s for an error, cut to 32 bytes: a literal can be megabytes
 func brief(s string) string {
@@ -490,13 +509,6 @@ func numCause(err error) error {
 		return ne.Err
 	}
 	return err
-}
-
-func signPrefix(negative bool) string {
-	if negative {
-		return "-"
-	}
-	return ""
 }
 
 // Keep the package's decimal-key restriction independent of numeric range.

@@ -8,15 +8,14 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 	"unicode/utf8"
 )
 
-// Marshal encodes a struct or string-keyed map with deterministic key order.
-// Nil pointer/interface fields are omitted; nil pointer/interface array elements,
-// cycles/excessive nesting,
-// non-finite floats, and integers outside TOML's signed 64-bit range error.
-// Comments and whitespace are not retained. Datetimes are not supported.
+// Marshal encodes a struct or string-keyed map with deterministic key order, laid
+// out as Format lays it. Nil pointer/interface fields are omitted; nil
+// pointer/interface array elements, cycles/excessive nesting, non-finite floats,
+// and integers outside TOML's signed 64-bit range error. Datetimes are not
+// supported.
 func Marshal(v any) ([]byte, error) {
 	var e encoder
 	if err := e.table(reflect.ValueOf(v), "", 0); err != nil {
@@ -27,7 +26,8 @@ func Marshal(v any) ([]byte, error) {
 
 type encoder struct{ buf bytes.Buffer }
 type entry struct {
-	key   string
+	name  string // the key
+	key   string // as a document spells it
 	value reflect.Value
 }
 
@@ -58,52 +58,44 @@ func entries(v reflect.Value) ([]entry, error) {
 		if v.Type().Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map keys must be strings")
 		}
-		out = make([]entry, 0, v.Len())
-		it := v.MapRange()
-		for it.Next() {
-			out = append(out, entry{it.Key().String(), it.Value()})
+		// The values go into one array, each set in place, not a copy apiece
+		n := v.Len()
+		out = make([]entry, 0, n)
+		values := reflect.MakeSlice(reflect.SliceOf(v.Type().Elem()), n, n)
+		key := reflect.New(v.Type().Key()).Elem()
+		for it := v.MapRange(); it.Next() && len(out) < n; {
+			key.SetIterKey(it)
+			value := values.Index(len(out))
+			value.SetIterValue(it)
+			out = append(out, entry{name: key.String(), value: value})
 		}
 	case reflect.Struct:
-		t := v.Type()
-		out = make([]entry, 0, t.NumField())
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() {
-				continue
+		fields := fieldsOf(v.Type())
+		out = make([]entry, 0, len(fields))
+		for _, f := range fields {
+			if value := v.Field(f.index); !f.omitempty || !isEmptyValue(value) {
+				out = append(out, entry{name: f.key, value: value})
 			}
-			parts := strings.Split(f.Tag.Get("toml"), ",")
-			if parts[0] == "-" {
-				continue
-			}
-			key := f.Name
-			if parts[0] != "" {
-				key = parts[0]
-			}
-			if slices.Contains(parts[1:], "omitempty") && isEmptyValue(v.Field(i)) {
-				continue
-			}
-			out = append(out, entry{key, v.Field(i)})
 		}
 	default:
 		return nil, fmt.Errorf("expected struct or map, got %s", v.Kind())
 	}
-	slices.SortFunc(out, func(a, b entry) int { return cmp.Compare(a.key, b.key) })
+	slices.SortFunc(out, func(a, b entry) int { return cmp.Compare(a.name, b.name) })
 	result := out[:0]
 	previous := ""
 	for i, x := range out {
-		if _, err := keyText(x.key); err != nil {
+		if x.key, err = keyText(x.name); err != nil {
 			return nil, err
 		}
-		if i > 0 && previous == x.key {
-			return nil, fmt.Errorf("duplicate TOML key %q", x.key)
+		if i > 0 && previous == x.name {
+			return nil, fmt.Errorf("duplicate TOML key %q", x.name)
 		}
-		previous = x.key
-		value, err := indirect(x.value)
-		if err != nil {
+		previous = x.name
+		if x.value, err = indirect(x.value); err != nil {
 			return nil, err
 		}
-		if value.IsValid() {
-			result = append(result, entry{x.key, value})
+		if x.value.IsValid() {
+			result = append(result, x)
 		}
 	}
 	return result, nil
@@ -121,32 +113,32 @@ func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 	if err != nil {
 		return err
 	}
-	var tables []entry
+	tables := fields[:0] // filtered in place: a table is never ahead of its entry
 	for _, x := range fields {
-		key, _ := keyText(x.key)
-		if (isTable(x.value) || isTableArray(x.value)) && len(prefix)+len(key) < maxHeaderBytes {
+		if (isTable(x.value) || isTableArray(x.value)) && len(prefix)+len(x.key) < maxHeaderBytes {
 			tables = append(tables, x)
 			continue
 		}
-		e.buf.WriteString(key + " = ")
+		e.buf.WriteString(x.key)
+		e.buf.WriteString(" = ")
 		if err := e.value(x.value, depth+1); err != nil {
-			return fmt.Errorf("key %q: %w", x.key, err)
+			return fmt.Errorf("key %q: %w", x.name, err)
 		}
 		e.buf.WriteByte('\n')
 	}
 	for _, x := range tables {
-		key, _ := keyText(x.key)
+		key := x.key
 		if prefix != "" {
 			key = prefix + "." + key
 		}
 		if isTable(x.value) {
-			e.buf.WriteString("\n[" + key + "]\n")
+			e.header(key, "[", "]")
 			if err := e.table(x.value, key, depth+1); err != nil {
 				return err
 			}
 		} else {
 			for i := 0; i < x.value.Len(); i++ {
-				e.buf.WriteString("\n[[" + key + "]]\n")
+				e.header(key, "[[", "]]")
 				if err := e.table(x.value.Index(i), key, depth+1); err != nil {
 					return err
 				}
@@ -154,6 +146,17 @@ func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 		}
 	}
 	return nil
+}
+
+// header writes a table's header a blank line below what is above it
+func (e *encoder) header(key, open, close string) {
+	if e.buf.Len() > 0 {
+		e.buf.WriteString("\n")
+	}
+	e.buf.WriteString(open)
+	e.buf.WriteString(key)
+	e.buf.WriteString(close)
+	e.buf.WriteString("\n")
 }
 
 func isTable(v reflect.Value) bool { return v.Kind() == reflect.Map || v.Kind() == reflect.Struct }
@@ -190,22 +193,22 @@ func (e *encoder) value(v reflect.Value, depth int) error {
 		}
 		e.string(v.String())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		e.buf.WriteString(strconv.FormatInt(v.Int(), 10))
+		e.buf.Write(strconv.AppendInt(e.buf.AvailableBuffer(), v.Int(), 10))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		if v.Uint() > math.MaxInt64 {
 			return fmt.Errorf("unsigned integer %d exceeds TOML int64 range", v.Uint())
 		}
-		e.buf.WriteString(strconv.FormatUint(v.Uint(), 10))
+		e.buf.Write(strconv.AppendUint(e.buf.AvailableBuffer(), v.Uint(), 10))
 	case reflect.Float32, reflect.Float64:
 		f := v.Float()
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return fmt.Errorf("non-finite float")
 		}
-		s := strconv.FormatFloat(f, 'g', -1, v.Type().Bits())
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
+		b := strconv.AppendFloat(e.buf.AvailableBuffer(), f, 'g', -1, v.Type().Bits())
+		if !bytes.ContainsAny(b, ".eE") {
+			b = append(b, ".0"...)
 		}
-		e.buf.WriteString(s)
+		e.buf.Write(b)
 	case reflect.Slice, reflect.Array:
 		e.buf.WriteByte('[')
 		for i := 0; i < v.Len(); i++ {
@@ -225,13 +228,17 @@ func (e *encoder) value(v reflect.Value, depth int) error {
 		e.buf.WriteByte('{')
 		for i, x := range fields {
 			if i > 0 {
-				e.buf.WriteString(", ")
+				e.buf.WriteByte(',')
 			}
-			key, _ := keyText(x.key)
-			e.buf.WriteString(key + " = ")
+			e.buf.WriteByte(' ')
+			e.buf.WriteString(x.key)
+			e.buf.WriteString(" = ")
 			if err := e.value(x.value, depth+1); err != nil {
 				return err
 			}
+		}
+		if len(fields) > 0 {
+			e.buf.WriteByte(' ')
 		}
 		e.buf.WriteByte('}')
 	default:
@@ -274,7 +281,7 @@ func (e *encoder) string(s string) {
 		case '\f':
 			e.buf.WriteString(`\f`)
 		default:
-			if r < 0x20 || r == 0x7f {
+			if r < 0x20 || r == 0x7f || hides(r) {
 				fmt.Fprintf(&e.buf, `\u%04X`, r)
 			} else {
 				e.buf.WriteRune(r)
