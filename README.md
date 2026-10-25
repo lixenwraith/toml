@@ -89,19 +89,30 @@ data = doc.Bytes()
 ```
 
 `ParseDocument` parses as `Parse` does and keeps the bytes. An edit rewrites only
-the statements it names, so comments, blank lines, order and the spelling of
-every other value stay as written; the result is parsed again, and an edit it
-would not parse after is refused with the document unchanged.
+the statements it names, with the comments that are theirs, so blank lines,
+order, every other comment and the spelling of every other value stay as
+written; the result is parsed again, and an edit it would not parse after is
+refused with the document unchanged.
+
+A group of comment lines belongs to whichever side fewer blank lines part it
+from, the side below on a tie: the statement right under it, or the run of
+statements (lines no blank line parts) above or below it. The file's start and
+end count as sides, so a comment at the top with a blank line under it, or at
+the end with one above it, belongs to the file and stays. Between two runs,
+several groups split at the widest gap.
 
 - `Set` replaces the value of a key the document sets, keeping the rest of its
   line and its comment. A key it lacks goes after the last key of its table,
   spelled as that key is (`play.mouse` beside `play.hud`), else after the table's
-  header, else in a `[table]` appended at the end. A key under an array of
-  tables, inside an inline table or array, or naming a table fails. The value is
-  encoded as `Marshal` writes one.
+  header, else in a `[table]` appended at the end, above the file's closing
+  comments. A root key with no other goes above the first table and its
+  comments. A key under an array of tables, inside an inline table or array, or
+  naming a table fails. The value is encoded as `Marshal` writes one.
 - `Delete` removes the key and every key under it: each statement setting one and
-  each header naming one, in every table of an array of tables. It reports
-  whether it removed anything; a key inside an inline value fails.
+  each header naming one, in every table of an array of tables, each with its
+  comments. A run of statements going whole takes the comments that belong to
+  it and one blank run beside it. It reports whether it removed anything; a key
+  inside an inline value fails.
 - `Unmapped` names the keys no field of the destination takes, matched as `Decode`
   matches them (tags, then field names; unexported and `-` fields take nothing),
   each once and sorted. A map or interface destination takes every key under it;

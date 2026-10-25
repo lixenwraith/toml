@@ -30,23 +30,35 @@ func (k Key) String() string {
 func (k Key) under(p Key) bool { return len(k) >= len(p) && slices.Equal(k[:len(p)], p) }
 
 // Document is a parsed document that keeps its bytes. An edit rewrites only the
-// statements it names, so comments, blank lines, order and the spelling of every
-// other value stay as written, and the result is parsed again before it stands.
+// statements it names, with the comments that belong to them, so blank lines,
+// order, every other comment and the spelling of every other value stay as
+// written, and the result is parsed again before it stands.
 type Document struct {
 	data  []byte
 	tree  map[string]any
 	stmts []statement
+	units []unit
+	pre   int // where the comments heading the file end, 0 when none
+	foot  int // where those closing it start, -1 when none
 }
 
 // statement is a table header or a key and its value, as the lines it spans: from
 // the start of its line through its newline, a comment after it on that line
-// included. A key is its path relative to scope, the header it sits under.
+// included. lead is where the comment lines right above it, which are its own,
+// start. A key is its path relative to scope, the header it sits under.
 type statement struct {
-	start, end int
-	scope, key Key
-	header     bool
-	array      bool   // an [[array]] header
-	value      [2]int // a key's value bytes
+	start, end, lead int
+	scope, key       Key
+	header           bool
+	array            bool   // an [[array]] header
+	value            [2]int // a key's value bytes
+}
+
+// unit is a run of statements no blank line parts, from the first comment line
+// that belongs to the run through the last, whole lines: stmts[first:last]
+type unit struct {
+	start, end  int
+	first, last int
 }
 
 func (s statement) path() Key {
@@ -63,12 +75,94 @@ func ParseDocument(data []byte) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Document{data: data, tree: tree, stmts: statements(data)}, nil
+	d := layout(data)
+	d.tree = tree
+	return &d, nil
 }
 
-// statements splits a document the parser accepted into its statements
-func statements(data []byte) []statement {
-	lx := NewLexer(data)
+// item is a statement, or a group of comment lines no blank line parts, with the
+// blank lines between it and the item before it or the file's start
+type item struct {
+	start, end int
+	stmt       int // its index in stmts, -1 for comments
+	gap        int
+}
+
+// layout splits a document the parser accepted into statements and units and
+// gives each comment group to the side fewer blank lines part it from, below on
+// a tie
+func layout(data []byte) Document {
+	d := Document{data: data, foot: -1}
+	items := d.scan()
+	para := make([]int, len(items)) // a statement's unit
+	open := false                   // no blank line since the last unit's last item
+	for k, it := range items {
+		open = open && it.gap == 0
+		if it.stmt < 0 {
+			continue
+		}
+		if !open {
+			d.units = append(d.units, unit{start: it.start, first: it.stmt})
+		}
+		para[k], open = len(d.units)-1, true
+		d.units[para[k]].end, d.units[para[k]].last = it.end, it.stmt+1
+	}
+	for i := 0; i < len(items); {
+		if items[i].stmt >= 0 {
+			i++
+			continue
+		}
+		j := i
+		for j < len(items) && items[j].stmt < 0 {
+			j++
+		}
+		split := placeComments(items, i, j)
+		for _, c := range items[i:split] {
+			if i == 0 {
+				d.pre = c.end
+			} else {
+				d.units[para[i-1]].end = max(d.units[para[i-1]].end, c.end)
+			}
+		}
+		for _, c := range items[split:j] {
+			if j < len(items) {
+				d.units[para[j]].start = min(d.units[para[j]].start, c.start)
+			} else if d.foot < 0 {
+				d.foot = c.start
+			}
+		}
+		if split < j && j < len(items) && items[j].gap == 0 {
+			d.stmts[items[j].stmt].lead = items[j-1].start
+		}
+		i = j
+	}
+	return d
+}
+
+// placeComments splits the comment groups items[i:j] at the widest run of blank
+// lines around them, the first of equals: those above it go with what is above,
+// the rest with what is below. The file's start counts as no blank line and its
+// end as half of one, so a comment touching a statement stays with it.
+func placeComments(items []item, i, j int) int {
+	split, widest := i, -1
+	for k := i; k <= j; k++ {
+		w := 1 // the file's end
+		switch {
+		case k == 0:
+			w = 0
+		case k < len(items):
+			w = 2 * items[k].gap
+		}
+		if w > widest {
+			split, widest = k, w
+		}
+	}
+	return split
+}
+
+// scan lexes data into its items, appending d.stmts
+func (d *Document) scan() (items []item) {
+	lx := Lexer{input: d.data, line: 1, lean: true}
 	t := lx.NextToken()
 	key := func() Key {
 		var k Key
@@ -92,12 +186,26 @@ func statements(data []byte) []statement {
 		return end
 	}
 	var (
-		out   []statement
 		scope Key
+		blank int
 	)
 	for t.Type != TokenEOF {
-		s := statement{start: bytes.LastIndexByte(data[:t.Pos], '\n') + 1, scope: scope}
+		start := bytes.LastIndexByte(d.data[:t.Pos], '\n') + 1
+		s := statement{start: start, lead: start, scope: scope}
 		switch t.Type {
+		case TokenNewline:
+			blank++
+			t = lx.NextToken()
+			continue
+		case TokenComment:
+			end := lineEnd()
+			if n := len(items); n > 0 && items[n-1].stmt < 0 && blank == 0 {
+				items[n-1].end = end
+			} else {
+				items = append(items, item{start: start, end: end, stmt: -1, gap: blank})
+			}
+			blank = 0
+			continue
 		case TokenLBracket:
 			s.header, t = true, lx.NextToken()
 			if t.Type == TokenLBracket {
@@ -108,7 +216,7 @@ func statements(data []byte) []statement {
 				t = lx.NextToken()
 			}
 			s.scope, scope = nil, s.key
-		case TokenIdent, TokenString:
+		default: // a key
 			s.key = key()
 			t = lx.NextToken() // past =
 			s.value[0] = t.Pos
@@ -126,14 +234,13 @@ func statements(data []byte) []statement {
 					break
 				}
 			}
-		default: // a blank or comment line
-			t = lx.NextToken()
-			continue
 		}
 		s.end = lineEnd()
-		out = append(out, s)
+		items = append(items, item{start: s.start, end: s.end, stmt: len(d.stmts), gap: blank})
+		d.stmts = append(d.stmts, s)
+		blank = 0
 	}
-	return out
+	return items
 }
 
 // Bytes is the document as it now reads; the caller must not change it
@@ -206,23 +313,54 @@ func unmapped(data any, t reflect.Type, at Key, seen map[string]Key, depth int) 
 }
 
 // Delete removes key and every key under it: each statement setting one and each
-// table header naming one, in every table of an array of tables, every other line
-// kept. It reports whether anything was removed; a key inside an inline value, a
-// table or array written as a value, cannot be edited and fails.
+// table header naming one, in every table of an array of tables, with the comments
+// that are theirs. A run of statements that goes whole takes the comments around
+// it and one of the blank runs beside it; every other line is kept. It reports
+// whether anything was removed; a key inside an inline value, a table or array
+// written as a value, cannot be edited and fails.
 func (d *Document) Delete(key Key) (bool, error) {
-	var out []byte
-	at := 0
-	for _, s := range d.stmts {
+	gone := make([]bool, len(d.stmts))
+	some := false
+	for i, s := range d.stmts {
 		p := s.path()
 		if !s.header && len(p) < len(key) && key.under(p) && d.inline(s) {
 			return false, fmt.Errorf("key %s is inside the value of %s", key, p)
 		}
-		if p.under(key) {
-			out, at = append(out, d.data[at:s.start]...), s.end
-		}
+		gone[i] = p.under(key)
+		some = some || gone[i]
 	}
-	if at == 0 {
+	if !some {
 		return false, nil
+	}
+	whole := func(u unit) bool { return !slices.Contains(gone[u.first:u.last], false) }
+	var out []byte
+	at := 0
+	cut := func(from, to int) { out, at = append(out, d.data[at:from]...), to }
+	for k := 0; k < len(d.units); k++ {
+		u := d.units[k]
+		if !whole(u) {
+			for i := u.first; i < u.last; i++ {
+				if gone[i] {
+					cut(d.stmts[i].lead, d.stmts[i].end)
+				}
+			}
+			continue
+		}
+		j := k
+		for j+1 < len(d.units) && whole(d.units[j+1]) {
+			j++
+		}
+		switch {
+		case j+1 < len(d.units):
+			cut(u.start, d.units[j+1].start)
+		case d.foot >= 0:
+			cut(u.start, d.foot)
+		case k > 0:
+			cut(d.units[k-1].end, len(d.data))
+		default:
+			cut(d.pre, len(d.data))
+		}
+		k = j
 	}
 	return true, d.replace(append(out, d.data[at:]...))
 }
@@ -236,8 +374,10 @@ func (d *Document) inline(s statement) bool {
 // Set gives key the value v, encoded as Marshal writes a value. A key the document
 // sets has its value replaced, the rest of its line kept; a key it lacks goes after
 // the last key of its table, else after the table's header, else in a table
-// appended to the document. A key under an array of tables or inside an inline
-// value fails, and so does a value the document then would not parse with.
+// appended to the document, before the comments closing it. A root key with no
+// other goes above the first table and its comments. A key under an array of
+// tables or inside an inline value fails, and so does a value the document then
+// would not parse with.
 func (d *Document) Set(key Key, v any) error {
 	if len(key) == 0 || v == nil {
 		return fmt.Errorf("a key and a value are needed")
@@ -268,21 +408,22 @@ func (d *Document) Set(key Key, v any) error {
 			}
 		}
 	}
-	head := ""
+	head, foot := "", "\n"
 	switch {
 	case after >= 0:
-	case len(parent) == 0: // a root key goes before the first header
+	case len(parent) == 0 && len(d.units) > 0: // a blank line keeps the table's comments its own
+		after, foot = d.units[0].start, "\n\n"
+	case len(parent) == 0:
 		after = len(d.data)
-		if i := slices.IndexFunc(d.stmts, func(s statement) bool { return s.header }); i >= 0 {
-			after = d.stmts[i].start
-		}
+	case d.foot >= 0:
+		after, scope, head, foot = d.foot, parent, "["+parent.String()+"]\n", "\n\n"
 	default:
 		after, scope, head = len(d.data), parent, "["+parent.String()+"]\n"
 		if after > 0 {
 			head = "\n" + head
 		}
 	}
-	line := slices.Concat([]byte(head+key[len(scope):].String()+" = "), value, []byte("\n"))
+	line := slices.Concat([]byte(head+key[len(scope):].String()+" = "), value, []byte(foot))
 	if after > 0 && d.data[after-1] != '\n' {
 		line = slices.Concat([]byte("\n"), line)
 	}
