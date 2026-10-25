@@ -23,7 +23,13 @@ func NewLexer(input []byte) *Lexer {
 
 func (l *Lexer) NextToken() Token {
 	l.skipWhitespace()
+	start := l.pos
+	t := l.next()
+	t.Pos, t.End = start, l.pos
+	return t
+}
 
+func (l *Lexer) next() Token {
 	if l.pos >= len(l.input) {
 		return l.newToken(TokenEOF, "")
 	}

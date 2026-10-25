@@ -16,3 +16,4 @@ jobs:
       - run: go vet ./...
       - run: go test -run '^$' -fuzz '^FuzzRoundTrip$' -fuzztime=15s -parallel=2
       - run: go test -run '^$' -fuzz '^FuzzIntegerConversions$' -fuzztime=10s -parallel=2
+      - run: go test -run '^$' -fuzz '^FuzzDocument$' -fuzztime=10s -parallel=2
