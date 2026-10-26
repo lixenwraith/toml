@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -255,6 +256,20 @@ func (d *Document) Decode(v any) error { return Decode(d.tree, v) }
 // Unmapped names the keys of the document that no field of v's type takes, as
 // the function Unmapped does
 func (d *Document) Unmapped(v any) []Key { return Unmapped(d.tree, v) }
+
+// UnknownKeys is the error of a caller that refuses the keys Unmapped names
+type UnknownKeys []Key
+
+func (u UnknownKeys) Error() string {
+	q := make([]string, len(u))
+	for i, k := range u {
+		q[i] = strconv.Quote(k.String())
+	}
+	if len(q) == 1 {
+		return "unknown key " + q[0]
+	}
+	return "unknown keys " + strings.Join(q, ", ")
+}
 
 // Unmapped names the keys of data, a value Parse produced, that no field of v's
 // type takes, as Decode, which ignores them, would match them; each once and

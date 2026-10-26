@@ -21,9 +21,9 @@ through the original pointer. Fixed arrays require an exact input length.
 Tags use `toml:"name,omitempty"`; an empty tag name
 falls back to the Go field name. Matching is case sensitive. Unknown input keys
 and unexported fields are ignored; `Unmapped(data, &target)` names the keys a
-parsed value holds that no field takes, so a caller can refuse them. A decode
-error names where it failed by the key path the document spells:
-`rooms[1].width: cannot convert string to int`.
+parsed value holds that no field takes, and a caller refusing them returns
+`UnknownKeys(keys)`, which quotes each. A decode error names where it failed by
+the key path the document spells: `rooms[1].width: cannot convert string to int`.
 
 ## Values and conversions
 
