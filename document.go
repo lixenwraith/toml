@@ -253,12 +253,16 @@ func (d *Document) Tree() map[string]any { return d.tree }
 func (d *Document) Decode(v any) error { return Decode(d.tree, v) }
 
 // Unmapped names the keys of the document that no field of v's type takes, as
-// Decode, which ignores them, would match them; each once and sorted. A key under
-// a map or interface destination is taken, and one under an array of tables is
-// named without its index.
-func (d *Document) Unmapped(v any) []Key {
+// the function Unmapped does
+func (d *Document) Unmapped(v any) []Key { return Unmapped(d.tree, v) }
+
+// Unmapped names the keys of data, a value Parse produced, that no field of v's
+// type takes, as Decode, which ignores them, would match them; each once and
+// sorted. A key under a map or interface destination is taken, and one under an
+// array of tables is named without its index.
+func Unmapped(data any, v any) []Key {
 	seen := make(map[string]Key)
-	unmapped(d.tree, reflect.TypeOf(v), nil, seen, 0)
+	unmapped(data, reflect.TypeOf(v), nil, seen, 0)
 	out := make([]Key, 0, len(seen))
 	for _, k := range seen {
 		out = append(out, k)

@@ -303,6 +303,29 @@ func TestDecodeErrorPathIsLinear(t *testing.T) {
 	}
 }
 
+// A decode error names where it failed by the key path the document spells
+func TestDecodeErrorNamesItsKeyPath(t *testing.T) {
+	type room struct {
+		Width int `toml:"width"`
+	}
+	var v struct {
+		Play  struct{ Sound bool } `toml:"play"`
+		Rooms []room               `toml:"rooms"`
+		ByKey map[string]room      `toml:"by_key"`
+	}
+	for _, tt := range []struct {
+		doc, want string
+	}{
+		{"play.Sound = 1", "play.Sound: cannot convert int64 to bool"},
+		{"rooms = [{ width = 1 }, { width = \"x\" }]", "rooms[1].width: cannot convert string to int"},
+		{"by_key.\"a b\".width = true", `by_key."a b".width: cannot convert bool to int`},
+	} {
+		if err := Unmarshal([]byte(tt.doc+"\n"), &v); err == nil || err.Error() != tt.want {
+			t.Errorf("%s: error %v, want %s", tt.doc, err, tt.want)
+		}
+	}
+}
+
 // Header paths are bounded: deep nesting is written inline past the bound,
 // so output stays linear and still round-trips
 func TestMarshal_HeaderLengthBounded(t *testing.T) {
