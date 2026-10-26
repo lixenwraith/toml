@@ -42,19 +42,23 @@ func decodeValue(data any, val reflect.Value) error {
 	return decodeAt(data, val, 0)
 }
 
-// pathError names where decoding failed. Each level adds its segment instead
-// of wrapping the message, which would copy the message once per level.
+// pathError names where decoding failed as the key path a document spells,
+// play.sound or rooms[0].width. Each level adds its segment instead of wrapping
+// the message, which would copy the message once per level.
 type pathError struct {
-	path []string // innermost first
+	path []string // innermost first: a key as keySegment spells it, an index as [n]
 	err  error
 }
 
 func (e *pathError) Error() string {
 	var b strings.Builder
 	for i := len(e.path) - 1; i >= 0; i-- {
+		if i < len(e.path)-1 && e.path[i][0] != '[' {
+			b.WriteByte('.')
+		}
 		b.WriteString(e.path[i])
-		b.WriteString(": ")
 	}
+	b.WriteString(": ")
 	b.WriteString(e.err.Error())
 	return b.String()
 }
@@ -67,6 +71,14 @@ func atPath(segment string, err error) error {
 		return pe
 	}
 	return &pathError{path: []string{segment}, err: err}
+}
+
+// keySegment spells a key in an error path: bare when it can be, else quoted and cut
+func keySegment(k string) string {
+	if len(k) <= 32 && isBareKey(k) {
+		return k
+	}
+	return brief(k)
 }
 
 func decodeAt(data any, val reflect.Value, depth int) error {
@@ -120,7 +132,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		}
 		for i := 0; i < len(dataSlice); i++ {
 			if err := decodeAt(dataSlice[i], newSlice.Index(i), depth+1); err != nil {
-				return atPath(fmt.Sprintf("index %d", i), err)
+				return atPath(fmt.Sprintf("[%d]", i), err)
 			}
 		}
 		val.Set(newSlice)
@@ -140,7 +152,7 @@ func decodeAt(data any, val reflect.Value, depth int) error {
 		for k, vData := range dataMap {
 			elem.SetZero()
 			if err := decodeAt(vData, elem, depth+1); err != nil {
-				return atPath("map key "+brief(k), err)
+				return atPath(keySegment(k), err)
 			}
 			key.SetString(k)
 			newMap.SetMapIndex(key, elem)
@@ -216,7 +228,7 @@ func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
 		// Look up in data map (case sensitive)
 		if vData, ok := data[f.key]; ok {
 			if err := decodeAt(vData, val.Field(f.index), depth+1); err != nil {
-				return atPath(val.Type().Name()+"."+f.name, err)
+				return atPath(keySegment(f.key), err)
 			}
 		}
 	}
@@ -227,7 +239,6 @@ func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
 type field struct {
 	index     int
 	key       string // the tag's name, else the Go name
-	name      string // the Go name
 	omitempty bool
 }
 
@@ -246,7 +257,7 @@ func fieldsOf(t reflect.Type) []field {
 		if !f.IsExported() || name == "-" {
 			continue
 		}
-		x := field{index: i, key: cmp.Or(name, f.Name), name: f.Name}
+		x := field{index: i, key: cmp.Or(name, f.Name)}
 		for o := range strings.SplitSeq(opts, ",") {
 			x.omitempty = x.omitempty || o == "omitempty"
 		}

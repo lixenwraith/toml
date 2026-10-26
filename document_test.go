@@ -195,6 +195,7 @@ func TestDocumentRefusesAnEditItCannotPlace(t *testing.T) {
 // TestUnmappedNamesWhatDecodeIgnores: keys no field takes, by tag or field name,
 // unexported and "-" fields included, are named once each, under arrays of tables
 // without their index; a map or interface destination takes every key under it.
+// A parsed tree is read as its document is, and UnknownKeys quotes each.
 func TestUnmappedNamesWhatDecodeIgnores(t *testing.T) {
 	doc := `top = 1
 skip = 2
@@ -247,6 +248,12 @@ nope = 1
 	want := []string{"byname.one.nope", "hidden", "items.odd", "skip", "sub.bad", "sub.deeper"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("unmapped %q, want %q", got, want)
+	}
+	if tree := Unmapped(d.Tree(), &v); !slices.EqualFunc(tree, d.Unmapped(&v), slices.Equal) {
+		t.Fatalf("the tree's unmapped %q differ from the document's", tree)
+	}
+	if err := UnknownKeys(d.Unmapped(&v)[:2]).Error(); err != `unknown keys "byname.one.nope", "hidden"` {
+		t.Fatalf("error %s", err)
 	}
 }
 

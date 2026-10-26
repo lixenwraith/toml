@@ -20,7 +20,10 @@ replace old containers. Existing pointer defaults are retained without writing
 through the original pointer. Fixed arrays require an exact input length.
 Tags use `toml:"name,omitempty"`; an empty tag name
 falls back to the Go field name. Matching is case sensitive. Unknown input keys
-and unexported fields are ignored.
+and unexported fields are ignored; `Unmapped(data, &target)` names the keys a
+parsed value holds that no field takes, and a caller refusing them returns
+`UnknownKeys(keys)`, which quotes each. A decode error names where it failed by
+the key path the document spells: `rooms[1].width: cannot convert string to int`.
 
 ## Values and conversions
 
@@ -121,7 +124,8 @@ split at the widest gap.
 - `Unmapped` names the keys no field of the destination takes, matched as `Decode`
   matches them (tags, then field names; unexported and `-` fields take nothing),
   each once and sorted. A map or interface destination takes every key under it;
-  a key under an array of tables is named without its index.
+  a key under an array of tables is named without its index. The function of the
+  same name reads any value `Parse` produced, a table inside one included.
 - `Key` is a dotted path, one segment per part; `Key.String` spells it as a
   document would, quoting segments that need it.
 
