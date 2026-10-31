@@ -1,7 +1,7 @@
 # toml
 
-A deterministic TOML subset encoder, decoder and formatter using Go standard library.
-Requires Go 1.27.1.
+A deterministic TOML subset encoder, decoder and formatter using Go standard library,
+with a macro expander for parsed documents (`macro`, below). Requires Go 1.27.1.
 
 ```go
 type Settings struct {
@@ -170,6 +170,66 @@ would not parse to the same values is refused.
 
 `Parse`, `Unmarshal` and `Decode` never format: they skip a comment without
 reading its text.
+
+## Macros
+
+```go
+import "github.com/lixenwraith/toml/macro"
+
+doc, err := toml.NewParser(data).Parse()
+doc, err = macro.ExpandDocument(doc) // a document that defines its own macros
+err = toml.Decode(doc, &target)
+
+set := macro.NewSet()       // one set shared by several documents
+err = set.Define(library)   // takes library's [macros]; a name defined twice is an error
+doc, err = set.Expand(doc)  // doc defines none; its invocations use the set
+```
+
+A macro is data in the document, expanded on the parsed tree between `Parse`
+and `Decode`, so nothing downstream of decoding sees anything but plain tables.
+A macro is a `[macros.<Name>]` table:
+
+- `params`: parameter name to type: `int`, `float` (an integer is accepted),
+  `bool`, `string`, `table`, `array` or `any`; `macro` and `each` are reserved.
+- `defaults`: values for optional parameters; every other parameter is required.
+- `doc`: one line for authors.
+- `body`: any value: a table, an array, a string or a number.
+
+Inside a body, `${name}` names a parameter, in a string or in a key. A string
+that is exactly one reference becomes the argument itself, of any type;
+elsewhere the argument is spliced into the text and must be a string, an integer
+or a boolean. `$$` is a literal `$`; any other `$` in a body is an error. Only
+bodies are templates: an argument's own text is never scanned.
+
+Any table with a `macro` key is an invocation; its other keys are arguments,
+checked against the parameters' types. As a value it is replaced by the
+expansion. As an array element, an array expansion is spliced into the array and
+any other is one element; with `each`, a table of parameter = array, all of one
+length, it expands once per zipped element. Bodies may invoke other macros and
+arguments may be invocations: arguments are expanded where they are written,
+then bound, then the body is substituted and expanded in turn.
+
+```toml
+[macros.Note]
+doc = "One note: pos, deg, dur in steps, vel"
+params = { pos = "int", deg = "int", dur = "int", vel = "float" }
+defaults = { dur = 1, vel = 0.5 }
+body = { pos = "${pos}", deg = "${deg}", dur = "${dur}", vel = "${vel}" }
+
+[[track]]
+instr = "lead"
+event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4] } }]
+```
+
+Definitions are checked when read: an unknown key, an unknown type, a default of
+the wrong type and a `${name}` naming no parameter are errors before any use.
+Expansion is a pure function of the documents given, so equal bytes expand to
+equal trees. A macro reached again through its own expansion, nesting deeper
+than 32, and more than 2^18 values produced through one set are errors, and an
+error names the invocation path through every macro involved. `Expand` refuses
+a document holding `[macros]` that `Define` has not taken, so a file meant only
+to invoke cannot define. Arrays come back as `[]any`, whatever form the parser
+gave them.
 
 ## Deliberate subset and deviations
 
