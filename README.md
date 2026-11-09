@@ -92,6 +92,7 @@ err = doc.Decode(&settings)
 unknown := doc.Unmapped(&settings)         // []toml.Key no field takes
 removed, err := doc.Delete(toml.Key{"play", "effects"})
 err = doc.Set(toml.Key{"play", "sfx"}, false)
+added, err := doc.Fill(shipped)             // keys a newer template sets, with their comments
 data = doc.Bytes()
 ```
 
@@ -114,13 +115,23 @@ split at the widest gap.
   spelled as that key is (`play.mouse` beside `play.hud`), else after the table's
   header, else in a `[table]` appended at the end, above the file's closing
   comments. A root key with no other goes above the first table and its
-  comments. A key under an array of tables, inside an inline table or array, or
-  naming a table fails. The value is encoded as `Marshal` writes one.
+  comments, or with no table above the file's closing comments. A key under an
+  array of tables, inside an inline table or array, or naming a table fails. The
+  value is encoded as `Marshal` writes one.
 - `Delete` removes the key and every key under it: each statement setting one and
   each header naming one, in every table of an array of tables, each with its
   comments. A run of statements going whole takes the comments that belong to
   it and one blank run beside it. It reports whether it removed anything; a key
   inside an inline value fails.
+- `Fill` adds each key another document sets that this one does not, as that
+  one writes it with the comments that are its own there, and names them: a
+  newer template's keys reach a file a person edited, every line of the file
+  kept. A key goes after the one the template sets before it in its table when
+  the file sets that, else after its table's header, else where `Set` puts it;
+  a table the file lacks comes as its header and that header's comments, where
+  `Set` puts a new table. A value the file holds at a key or over it (its own,
+  an inline table or an array of tables) stays the file's; the template's arrays
+  of tables are left out. The edit is one splice and one parse, linear in both.
 - `Unmapped` names the keys no field of the destination takes, matched as `Decode`
   matches them (tags, then field names; unexported and `-` fields take nothing),
   each once and sorted. A map or interface destination takes every key under it;

@@ -2,6 +2,7 @@ package toml
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"reflect"
 	"slices"
@@ -403,47 +404,227 @@ func (d *Document) Set(key Key, v any) error {
 		return fmt.Errorf("key %s: %w", key, err)
 	}
 	value := e.buf.Bytes()
+	i, at, err := d.find(key)
+	switch {
+	case err != nil:
+		return err
+	case i >= 0:
+		s := d.stmts[i]
+		return d.replace(slices.Concat(d.data[:s.value[0]], value, d.data[s.value[1]:]))
+	}
+	line := slices.Concat([]byte(key[len(at.scope):].String()+" = "), value, []byte("\n"))
+	return d.splice([]*insertion{{spot: at, lines: line}})
+}
+
+// spot is where lines the document lacks go: before the byte at, under head, a new
+// table's header, and above foot; a key there is spelled from scope. A spot for a
+// new table comes after any other at its byte.
+type spot struct {
+	at         int
+	scope      Key
+	head, foot string
+	table      bool
+}
+
+// insertion is the lines an edit writes at a spot, each ending in a newline
+type insertion struct {
+	spot
+	lines []byte
+}
+
+// find returns the statement setting key, or -1 and the spot Set puts it in
+func (d *Document) find(key Key) (int, spot, error) {
 	parent := key[:len(key)-1]
-	after, scope := -1, Key(nil) // where a missing key goes, and the scope it is spelled in
-	for _, s := range d.stmts {
+	at := spot{at: -1}
+	for i, s := range d.stmts {
 		p := s.path()
 		switch {
 		case s.header && s.array && key.under(p):
-			return fmt.Errorf("key %s is under the array of tables %s", key, p)
+			return -1, at, fmt.Errorf("key %s is under the array of tables %s", key, p)
 		case !s.header && slices.Equal(p, key):
-			return d.replace(slices.Concat(d.data[:s.value[0]], value, d.data[s.value[1]:]))
+			return i, at, nil
 		case !s.header && len(p) < len(key) && key.under(p):
-			return fmt.Errorf("key %s is inside the value of %s", key, p)
+			return -1, at, fmt.Errorf("key %s is inside the value of %s", key, p)
 		case p.under(key):
-			return fmt.Errorf("key %s is a table", key)
+			return -1, at, fmt.Errorf("key %s is a table", key)
 		case s.header && slices.Equal(p, parent):
-			after, scope = s.end, p
+			at.at, at.scope = s.end, p
 		case !s.header && len(p) > len(parent) && p.under(parent) && parent.under(s.scope):
-			if !slices.Equal(scope, parent) || slices.Equal(s.scope, parent) {
-				after, scope = s.end, s.scope
+			if !slices.Equal(at.scope, parent) || slices.Equal(s.scope, parent) {
+				at.at, at.scope = s.end, s.scope
 			}
 		}
 	}
-	head, foot := "", "\n"
 	switch {
-	case after >= 0:
+	case at.at >= 0:
 	case len(parent) == 0 && len(d.units) > 0: // a blank line keeps the table's comments its own
-		after, foot = d.units[0].start, "\n\n"
+		at.at, at.foot = d.units[0].start, "\n"
 	case len(parent) == 0:
-		after = len(d.data)
-	case d.foot >= 0:
-		after, scope, head, foot = d.foot, parent, "["+parent.String()+"]\n", "\n\n"
+		at = d.newTable()
+		at.table = false
 	default:
-		after, scope, head = len(d.data), parent, "["+parent.String()+"]\n"
-		if after > 0 {
-			head = "\n" + head
+		at = d.newTable()
+		at.scope, at.head = parent, at.head+"["+parent.String()+"]\n"
+	}
+	return -1, at, nil
+}
+
+// newTable is the spot a table the document lacks goes in: above the file's
+// closing comments, else at its end, a blank line apart from what is beside it
+func (d *Document) newTable() spot {
+	if d.foot >= 0 {
+		return spot{at: d.foot, foot: "\n", table: true}
+	}
+	return spot{at: len(d.data), head: "\n", table: true}
+}
+
+// splice writes each insertion at its spot, those at one byte in order, none
+// opening the file with a blank line, and makes the result the document once it
+// parses
+func (d *Document) splice(ins []*insertion) error {
+	order := func(in *insertion) int {
+		if in.table {
+			return 2*in.at + 1
+		}
+		return 2 * in.at
+	}
+	slices.SortStableFunc(ins, func(a, b *insertion) int { return cmp.Compare(order(a), order(b)) })
+	var out []byte
+	from := 0
+	for _, in := range ins {
+		out = append(out, d.data[from:in.at]...)
+		if from = in.at; len(out) > 0 && out[len(out)-1] != '\n' {
+			out = append(out, '\n')
+		}
+		head := in.head
+		if len(out) == 0 {
+			head = strings.TrimPrefix(head, "\n")
+		}
+		out = append(append(append(out, head...), in.lines...), in.foot...)
+	}
+	return d.replace(append(out, d.data[from:]...))
+}
+
+// Fill adds each key src sets that d does not, as src writes it with the comments
+// that are its own there, and names them in src's order. A key goes after the one
+// src sets before it in its table when d sets that, else after its table's header,
+// else where Set puts it; a table d lacks comes as its header and that header's
+// comments, where Set puts a new table. A value d holds at a key or over it, an
+// inline table or an array of tables, stays d's; src's arrays of tables are left out.
+func (d *Document) Fill(src *Document) ([]Key, error) {
+	keys, headers := make(map[string]statement), make(map[string]statement)
+	for _, s := range d.stmts {
+		switch k := s.path().String(); {
+		case !s.header:
+			keys[k] = s
+		case !s.array && headers[k].end == 0:
+			headers[k] = s
 		}
 	}
-	line := slices.Concat([]byte(head+key[len(scope):].String()+" = "), value, []byte(foot))
-	if after > 0 && d.data[after-1] != '\n' {
-		line = slices.Concat([]byte("\n"), line)
+	var (
+		added, arrays []Key
+		ins           []*insertion
+	)
+	past := make(map[int]*insertion)      // what goes past a statement of d, by its end
+	placed := make(map[string]*insertion) // where each key Fill adds goes, by the key
+	last := make(map[string]Key)          // the key src set last in each table, by the table
+	open := func(at spot) *insertion {
+		if in := past[at.at]; in != nil && !at.table {
+			return in
+		}
+		in := &insertion{spot: at}
+		if ins = append(ins, in); !at.table {
+			past[at.at] = in
+		}
+		return in
 	}
-	return d.replace(slices.Concat(d.data[:after], line, d.data[after:]))
+	for _, s := range src.stmts {
+		p := s.path()
+		if s.header && s.array {
+			arrays = append(arrays, p)
+		}
+		if slices.ContainsFunc(arrays, func(a Key) bool { return p.under(a) }) {
+			continue
+		}
+		name, table := p.String(), p[:len(p)-1]
+		prev := last[table.String()].String()
+		if !s.header {
+			last[table.String()] = p
+		}
+		if placed[name] != nil || d.holds(p, keys) {
+			continue
+		}
+		st, set := keys[prev]
+		h, headed := headers[table.String()]
+		var in *insertion
+		switch {
+		case s.header:
+			at := d.newTable()
+			at.scope = p
+			in = open(at)
+		case prev != "" && placed[prev] != nil:
+			in = placed[prev]
+		case prev != "" && set:
+			in = open(spot{at: st.end, scope: st.scope})
+		case placed[table.String()] != nil:
+			in = placed[table.String()]
+		case headed:
+			in = open(spot{at: h.end, scope: table})
+		default:
+			_, at, err := d.find(p)
+			if err != nil {
+				return nil, err
+			}
+			if in = open(at); at.table {
+				placed[table.String()] = in
+			}
+		}
+		in.lines = append(in.lines, src.lines(s, p[len(in.scope):])...)
+		if placed[name] = in; !s.header {
+			added = append(added, p)
+		}
+	}
+	if len(ins) == 0 {
+		return nil, nil
+	}
+	if err := d.splice(ins); err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// holds reports d has a value at key or over it: a key it sets, keys by their
+// names, that key is or is inside, or a value other than a table at a prefix of key
+func (d *Document) holds(key Key, keys map[string]statement) bool {
+	m := d.tree
+	for i, k := range key {
+		if _, ok := keys[key[:i+1].String()]; ok {
+			return true
+		}
+		v, ok := m[k]
+		if !ok {
+			return false
+		}
+		if m, ok = v.(map[string]any); !ok {
+			return true
+		}
+	}
+	return true
+}
+
+// lines is s as d writes it, from its own comments through its line, a key spelled
+// as key, indented as it is
+func (d *Document) lines(s statement, key Key) []byte {
+	out := d.data[s.lead:s.end]
+	if !s.header && !slices.Equal(key, s.key) {
+		line := d.data[s.start:s.end]
+		indent := line[:len(line)-len(bytes.TrimLeft(line, " \t"))]
+		out = slices.Concat(d.data[s.lead:s.start], indent, []byte(key.String()+" = "), d.data[s.value[0]:s.end])
+	}
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		out = slices.Concat(out, []byte("\n"))
+	}
+	return out
 }
 
 // replace makes data the document once it parses
