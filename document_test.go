@@ -2,6 +2,7 @@ package toml
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -144,8 +145,8 @@ func TestCommentsGoWithTheNearerSide(t *testing.T) {
 }
 
 // TestSetLeavesCommentsTheirOwners: a root key added above the first table keeps
-// a blank line from that table's comments, and a new table goes above the file's
-// closing comments.
+// a blank line from that table's comments, and a new table, or a first key in a
+// document of comments alone, goes above the file's closing comments.
 func TestSetLeavesCommentsTheirOwners(t *testing.T) {
 	for _, c := range []struct {
 		doc  string
@@ -154,6 +155,7 @@ func TestSetLeavesCommentsTheirOwners(t *testing.T) {
 	}{
 		{"# file\n\n# about a\n[a]\nx = 1\n", Key{"top"}, "# file\n\ntop = 1\n\n# about a\n[a]\nx = 1\n"},
 		{"[a]\nx = 1\n\n# end\n", Key{"b", "y"}, "[a]\nx = 1\n\n[b]\ny = 1\n\n# end\n"},
+		{"# file\n\n# end\n", Key{"top"}, "# file\n\ntop = 1\n\n# end\n"},
 	} {
 		d, err := ParseDocument([]byte(c.doc))
 		if err != nil {
@@ -189,6 +191,97 @@ func TestDocumentRefusesAnEditItCannotPlace(t *testing.T) {
 	}
 	if string(d.Bytes()) != doc {
 		t.Fatalf("a refused edit changed the document:\n%s", d.Bytes())
+	}
+}
+
+// TestFillAddsWhatSrcSetsWithItsComments: a key d lacks comes with its own
+// comments after the one src sets before it, else after its table's header; a
+// table d lacks comes with its header's comments above d's closing ones; every
+// line of d stays, its values over src's. An empty d filled reads as src but for
+// src's own opening comments.
+func TestFillAddsWhatSrcSetsWithItsComments(t *testing.T) {
+	d, err := ParseDocument([]byte("# mine\n\n[play]\n# my note\nmouse = false # mine\nhud = true\n\n[audio]\nbuffer_ms = 20\n\n# end\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := ParseDocument([]byte(`# template
+
+# what play holds
+[play]
+# first
+sfx = true
+# about mouse
+mouse = true
+# between
+volume = 0.5
+hud = false
+
+[audio]
+buffer_ms = 50
+
+# a new table
+[session]
+# keep places
+resume = true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, _ := ParseDocument(nil)
+	if _, err := empty.Fill(src); err != nil || string(empty.Bytes()) != string(src.Bytes()[len("# template\n\n"):]) {
+		t.Errorf("an empty document filled reads, %v:\n%s", err, empty.Bytes())
+	}
+	added, err := d.Fill(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `# mine
+
+[play]
+# first
+sfx = true
+# my note
+mouse = false # mine
+# between
+volume = 0.5
+hud = true
+
+[audio]
+buffer_ms = 20
+
+# a new table
+[session]
+# keep places
+resume = true
+
+# end
+`
+	if got := string(d.Bytes()); got != want {
+		t.Errorf("filled:\n%s\nwant:\n%s", got, want)
+	}
+	if got := fmt.Sprint(added); got != "[play.sfx play.volume session.resume]" {
+		t.Errorf("added %s", got)
+	}
+}
+
+// TestFillLeavesWhatDHolds: a key d sets, one inside d's inline table or array of
+// tables, or one under d's value stays d's, src's arrays of tables are left out,
+// and a key d's table spells dotted is spelled so.
+func TestFillLeavesWhatDHolds(t *testing.T) {
+	doc := "play.hud = true\nm = { a = 1 }\nx = 1\n[[arr]]\nn = 1\n"
+	d, err := ParseDocument([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := ParseDocument([]byte("[play]\nhud = false\nmouse = true\n[m]\nb = 2\n[x]\ny = 2\n[arr]\nk = 1\n[[list]]\nv = 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Fill(src); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(d.Bytes()), "play.hud = true\nplay.mouse = true\n"+doc[len("play.hud = true\n"):]; got != want {
+		t.Errorf("filled:\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -316,6 +409,25 @@ func FuzzDocument(f *testing.F) {
 				}
 				if err == nil && added && !keptLines(data, c.Bytes()) {
 					t.Fatalf("set of new %s lost a line:\n%s", k, c.Bytes())
+				}
+			}
+		}
+		for _, pair := range [][2]string{{string(data), string(data)}, {string(data), settingsDoc}, {settingsDoc, string(data)}, {"", string(data)}} {
+			c, _ := ParseDocument([]byte(pair[0]))
+			s, _ := ParseDocument([]byte(pair[1]))
+			added, err := c.Fill(s)
+			if err != nil {
+				t.Fatalf("fill of %q from %q: %v", pair[0], pair[1], err)
+			}
+			if !keptLines([]byte(pair[0]), c.Bytes()) {
+				t.Fatalf("fill of %q lost a line:\n%s", pair[0], c.Bytes())
+			}
+			if pair[0] == pair[1] && len(added) > 0 {
+				t.Fatalf("fill from itself added %v", added)
+			}
+			for _, k := range added {
+				if !reflect.DeepEqual(value(c.Tree(), k), value(s.Tree(), k)) {
+					t.Fatalf("filled %s reads %v, not %v:\n%s", k, value(c.Tree(), k), value(s.Tree(), k), c.Bytes())
 				}
 			}
 		}
