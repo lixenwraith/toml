@@ -215,12 +215,29 @@ or a boolean. `$$` is a literal `$`; any other `$` in a body is an error. Only
 bodies are templates: an argument's own text is never scanned.
 
 Any table with a `macro` key is an invocation; its other keys are arguments,
-checked against the parameters' types. As a value it is replaced by the
-expansion. As an array element, an array expansion is spliced into the array and
-any other is one element; with `each`, a table of parameter = array, all of one
-length, it expands once per zipped element. Bodies may invoke other macros and
+checked against the parameters' types. Bodies may invoke other macros and
 arguments may be invocations: arguments are expanded where they are written,
-then bound, then the body is substituted and expanded in turn.
+then bound, then the body is substituted and expanded in turn. Where an
+invocation stands decides what it becomes:
+
+- a value: the expansion;
+- an array element: an array expansion spliced into the array, any other one
+  element;
+- an array element holding `each`: an expansion for each element of the arrays
+  in `each`, every one spliced or appended so. `each` anywhere else is an error.
+
+`each` is a table of arguments, at least one, read once they are expanded:
+
+- An array is zipped: an element to an expansion, each checked against the
+  parameter's type. The arrays are all of one length.
+- Any other value is shared: every expansion takes it, exactly as it takes an
+  argument written beside `each`, and it is checked against the parameter's
+  type itself.
+- With no array in it, `each` expands once.
+- A parameter named in `each` and also given beside it is an error.
+- An array in `each` is always zipped, whatever its parameter's type: one that
+  every expansion takes whole, for an `array` or `any` parameter, is written
+  beside `each`.
 
 ```toml
 [macros.Note]
@@ -231,7 +248,7 @@ body = { pos = "${pos}", deg = "${deg}", dur = "${dur}", vel = "${vel}" }
 
 [[track]]
 instr = "lead"
-event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4] } }]
+event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4], vel = 0.8 } }]
 ```
 
 A default is checked as written and expands where it is used, so one that
@@ -243,11 +260,11 @@ other, `with` holds the arguments it fixes.
 
 ```toml
 [macros.Line]
-doc = "A line on instr: a note per pos and deg, all at vel"
-params = { instr = "string", pos = "array", deg = "array", vel = "float", follow = "bool" }
+doc = "A line on instr: a note per pos and deg, at one vel or at one each"
+params = { instr = "string", pos = "array", deg = "array", vel = "any", follow = "bool" }
 defaults = { vel = 0.5, follow = true }
 body = { instr = "${instr}", follow_chord = "${follow}", event = [
-  { macro = "Note", each = { pos = "${pos}", deg = "${deg}" }, vel = "${vel}" },
+  { macro = "Note", each = { pos = "${pos}", deg = "${deg}", vel = "${vel}" } },
 ] }
 
 [macros.Lead]

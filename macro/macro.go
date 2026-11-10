@@ -37,7 +37,7 @@ const (
 
 var (
 	errDefinitions = errors.New("[macros] is not allowed in this document")
-	errEach        = errors.New("each must be a table of parameter = array")
+	errEach        = errors.New("each must be a table of arguments")
 	errEachValue   = errors.New("each expands only inside an array")
 	errNesting     = fmt.Errorf("nests deeper than %d", maxNesting)
 )
@@ -879,7 +879,7 @@ func (e *expander) put(c *call, slot int, v any, h int) error {
 	return nil
 }
 
-// lists reads an each table, whose nesting is h: parameter = array, all one length
+// lists reads an each table, whose nesting is h: its arrays all one length
 func (e *expander) lists(c *call, v any, h int) error {
 	table, ok := v.(map[string]any)
 	if !ok || len(table) == 0 {
@@ -887,7 +887,11 @@ func (e *expander) lists(c *call, v any, h int) error {
 	}
 	base := e.sorted(table)
 	for i := base; i < base+len(table); i++ {
-		if err := e.list(c, e.keys[i], table[e.keys[i]], h-1); err != nil {
+		x, xh := table[e.keys[i]], h-1
+		if _, zipped := x.([]any); !zipped {
+			_, xh = measure(x) // its own nesting, as an argument beside each has
+		}
+		if err := e.list(c, e.keys[i], x, xh); err != nil {
 			return err
 		}
 	}
@@ -895,19 +899,24 @@ func (e *expander) lists(c *call, v any, h int) error {
 	return nil
 }
 
-// list binds one parameter of an each to its array. Keys arrive sorted, as
-// slots are, so the lists stand after the arguments in slot order.
+// list binds one parameter of an each: to its array, an element an expansion,
+// or to a value that is no array, which every expansion shares as an argument
+// beside each. Keys arrive sorted, as slots are, so the arrays stand after the
+// arguments in slot order.
 func (e *expander) list(c *call, key string, v any, h int) error {
 	slot, declared := c.m.slot(key)
 	if !declared {
 		return fmt.Errorf("each: unknown argument %s", quote(key))
 	}
-	list, isArray := v.([]any)
+	list, zipped := v.([]any)
 	switch {
 	case c.given&(1<<slot) != 0:
 		return fmt.Errorf("each: argument %s is also given directly", quote(key))
-	case !isArray:
-		return fmt.Errorf("each: argument %s must be an array", quote(key))
+	case !zipped:
+		if err := e.put(c, slot, v, h); err != nil {
+			return fmt.Errorf("each: %w", err)
+		}
+		return nil
 	case c.each != 0 && len(list) != c.count:
 		return fmt.Errorf("each: argument %s has %d elements, the others %d", quote(key), len(list), c.count)
 	}

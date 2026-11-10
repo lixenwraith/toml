@@ -783,6 +783,113 @@ func TestErrorsNameThePathThroughWith(t *testing.T) {
 	}
 }
 
+// hit is the lane the tests of each write
+const hit = `
+[macros.Hit]
+params = { pos = "int", vel = "float", tags = "any" }
+defaults = { tags = 0 }
+body = { pos = "${pos}", vel = "${vel}", tags = "${tags}" }
+`
+
+// A value in each that is no array is every expansion's, as the same argument
+// beside each is: the same tree at the same cost, each expansion its own copy
+func TestEachSharesAValueThatIsNotAnArray(t *testing.T) {
+	got, spent, err := through(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], vel = 0.8, tags = { on = [1] } } }]\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	equal(t, got, "[x]\nevent = [{ pos = 0, vel = 0.8, tags = { on = [1] } }, { pos = 4, vel = 0.8, tags = { on = [1] } }]\n")
+	hold(t, map[uintptr]bool{}, got)
+	want, wantSpent, err := through(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4] }, vel = 0.8, tags = { on = [1] } }]\n")
+	if err != nil || !reflect.DeepEqual(got, want) || spent != wantSpent {
+		t.Fatalf("shared in each spent %d, beside each %d: %v\n got %v\nwant %v", spent, wantSpent, err, got, want)
+	}
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], tags = [1], vel = 0.8 } }]\n",
+		`each: argument "tags" has 1 elements, the others 2`)
+}
+
+// An array's elements are each an argument; a shared value is one whole,
+// whether or not an expansion comes to use it
+func TestASharedValueIsCheckedAgainstItsParametersType(t *testing.T) {
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, \"four\"], vel = 0.8 } }]\n",
+		`x.event[0]: macro "Hit": each: argument "pos"[1]: want int, got string`)
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], vel = \"loud\" } }]\n",
+		`x.event[0]: macro "Hit": each: argument "vel": want float, got string`)
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [], vel = \"loud\" } }]\n",
+		`x.event[0]: macro "Hit": each: argument "vel": want float, got string`)
+}
+
+func TestAnEachWithNoArrayExpandsOnce(t *testing.T) {
+	got := expand(t, hit+"[x]\nevent = [{ first = true }, { macro = \"Hit\", each = { pos = 4, vel = 0.8 } }]\n")
+	equal(t, got, "[x]\nevent = [{ first = true }, { pos = 4, vel = 0.8, tags = 0 }]\n")
+	refuse(t, hit+"[x]\nevent = { macro = \"Hit\", each = { pos = 4, vel = 0.8 } }\n", `x.event: each expands only inside an array`)
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", pos = 4, vel = 0.8, each = {} }]\n", `each must be a table of arguments`)
+}
+
+func TestAParameterInEachIsNotAlsoGivenDirectly(t *testing.T) {
+	for _, each := range []string{"{ pos = [0, 4], vel = 0.8 }", "{ pos = [0, 4], vel = [0.8, 0.6] }"} {
+		refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", vel = 0.5, each = "+each+" }]\n",
+			`x.event[0]: macro "Hit": each: argument "vel" is also given directly`)
+	}
+}
+
+// each is read in a document, in a body that writes it as a table, a field a
+// parameter, and in a body that takes the whole table as one argument: one
+// body serves a velocity that is a number and one that is a list
+func TestSharingHoldsOnEveryPathThatReadsEach(t *testing.T) {
+	got := expand(t, hit+`
+[macros.Drum]
+params = { instr = "string", pos = "array", vel = "any" }
+body = { instr = "${instr}", event = [{ macro = "Hit", each = { pos = "${pos}", vel = "${vel}", tags = "x" } }] }
+
+[macros.Lane]
+params = { lists = "table" }
+body = [{ macro = "Hit", each = "${lists}" }]
+
+[[track]]
+macro = "Drum"
+instr = "kick"
+pos = [0, 4]
+vel = 0.8
+[[track]]
+macro = "Drum"
+instr = "snare"
+pos = [4, 12]
+vel = [1.0, 0.9]
+
+[x]
+event = [{ macro = "Lane", lists = { pos = [2, 6], vel = 0.5 } }, { macro = "Hit", each = { pos = [1], vel = 0.25 } }]
+`)
+	equal(t, got, `
+[[track]]
+instr = "kick"
+event = [{ pos = 0, vel = 0.8, tags = "x" }, { pos = 4, vel = 0.8, tags = "x" }]
+[[track]]
+instr = "snare"
+event = [{ pos = 4, vel = 1.0, tags = "x" }, { pos = 12, vel = 0.9, tags = "x" }]
+
+[x]
+event = [{ pos = 2, vel = 0.5, tags = 0 }, { pos = 6, vel = 0.5, tags = 0 }, { pos = 1, vel = 0.25, tags = 0 }]
+`)
+}
+
+// Where a parameter takes an array, an array in each is still an element per
+// expansion: one for every expansion to take whole is written beside each
+func TestAnArrayInEachIsAlwaysZipped(t *testing.T) {
+	got := expand(t, hit+`
+[x]
+zipped = [{ macro = "Hit", each = { pos = [0, 4], tags = ["a", ["b"]] }, vel = 0.8 }]
+beside = [{ macro = "Hit", each = { pos = [0, 4] }, tags = ["a", ["b"]], vel = 0.8 }]
+`)
+	equal(t, got, `
+[x]
+zipped = [{ pos = 0, vel = 0.8, tags = "a" }, { pos = 4, vel = 0.8, tags = ["b"] }]
+beside = [{ pos = 0, vel = 0.8, tags = ["a", ["b"]] }, { pos = 4, vel = 0.8, tags = ["a", ["b"]] }]
+`)
+	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], tags = [\"a\"] }, vel = 0.8 }]\n",
+		`each: argument "tags" has 1 elements, the others 2`)
+}
+
 // Scenarios arrive from peers: any parsed document either expands or is refused,
 // the same way each time, into a result that holds no invocation and shares
 // nothing with the document.
@@ -792,6 +899,7 @@ func FuzzExpandDocument(f *testing.F) {
 	f.Add("a = { macro = \"M\" }\n")
 	f.Add("[macros.M]\nparams = { t = \"table\", l = \"array\" }\ndefaults = { l = [{ macro = \"N\" }] }\nbody = { a = \"${t}\", b = \"${t}\", \"k${l}\" = [\"${l}\"] }\n[macros.N]\nbody = [[1]]\n[[x]]\nmacro = \"M\"\nt = { u = [{}] }\n")
 	f.Add("[macros.A]\nbase = \"B\"\nparams = { b = \"int\" }\ndefaults = { a = 1 }\nwith = { b = [\"${b}\", { macro = \"C\" }] }\n[macros.B]\nparams = { a = \"int\", b = \"any\", c = \"table\" }\ndefaults = { c = { macro = \"C\" } }\nbody = { a = \"${a}\", b = \"${b}\", c = [\"${c}\"] }\n[macros.C]\nbase = \"B\"\nwith = { a = 2, b = {}, c = {} }\n[[x]]\nmacro = \"A\"\nb = 3\n")
+	f.Add("[macros.Hit]\nparams = { pos = \"int\", vel = \"any\" }\nbody = { pos = \"${pos}\", vel = \"${vel}\" }\n[macros.Drum]\nparams = { pos = \"array\", vel = \"any\", lists = \"table\" }\ndefaults = { lists = { pos = [9], vel = { k = [1] } } }\nbody = [{ macro = \"Hit\", each = { pos = \"${pos}\", vel = \"${vel}\" } }, { macro = \"Hit\", each = \"${lists}\" }]\n[x]\na = [{ macro = \"Drum\", each = { pos = [[0, 4]], vel = 0.5 } }, { macro = \"Drum\", pos = [2], vel = [0.25] }]\n")
 	f.Fuzz(func(t *testing.T, src string) {
 		doc, err := toml.NewParser([]byte(src)).Parse()
 		if err != nil {
