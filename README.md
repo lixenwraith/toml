@@ -74,8 +74,8 @@ overflowing the stack. Parsing bounds individual value nesting and dotted paths;
 combining paths can still produce trees that exceed the encoder's bound. A
 document may create at most `DefaultMaxTables` (65536) tables, counting every
 dotted-key segment and header part; set `Parser.MaxTables` before `Parse` to
-change it. Errors quote keys and cut long literals, and never repeat a string
-value. `Marshal` writes a table inline once its header path would pass 256
+change it. Errors quote keys, cut a key or a literal past 32 bytes, and never
+repeat a string value. `Marshal` writes a table inline once its header path would pass 256
 bytes, so output stays linear in depth.
 
 `Marshal` writes an inline table as `{ a = 1 }` and a blank line above each
@@ -232,15 +232,40 @@ instr = "lead"
 event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4] } }]
 ```
 
+A default is checked as written and expands where it is used, so one that
+invokes is a `table` or `any` parameter's. A document built in Go may hold any
+integer or float type where the parser gives `int64` and `float64`.
+
 Definitions are checked when read: an unknown key, an unknown type, a default of
-the wrong type and a `${name}` naming no parameter are errors before any use.
-Expansion is a pure function of the documents given, so equal bytes expand to
-equal trees. A macro reached again through its own expansion, nesting deeper
-than 32, and more than 2^18 values produced through one set are errors, and an
-error names the invocation path through every macro involved. `Expand` refuses
-a document holding `[macros]` that `Define` has not taken, so a file meant only
-to invoke cannot define. Arrays come back as `[]any`, whatever form the parser
-gave them.
+the wrong type and a `${name}` naming no parameter are errors before any use. A
+body is read once, into the template every invocation instantiates, so an
+expansion costs what it reads and writes: the document, and the values it
+writes. Expansion is a pure function of the documents given, so equal bytes
+expand to equal trees.
+
+`Expand` does not modify its document, and its result shares no table or array
+with the document or the set: writing over a result reaches neither. Arrays
+come back as `[]any`, whatever form the parser gave them. `Expand` refuses a
+document holding `[macros]` that `Define` has not taken, so a file meant only
+to invoke cannot define. The zero `Set` is an empty one; a set is not for
+concurrent use.
+
+A document may come from a peer, so every expansion is bounded, and passing a
+bound is an error:
+
+- a macro reached again through its own expansion, and invocations nested
+  deeper than 32;
+- `Set.MaxValues` values written through one set, `DefaultMaxValues` (2^18)
+  when zero: each value a body writes, a copied argument's or default's among
+  them, summed over every `Expand`, so a set's documents share one budget;
+- a result nested deeper than 1000 levels, which is what `Decode` and `Marshal`
+  take, and a document nested so before it expands;
+- a macro of more than 64 parameters.
+
+An error names the invocation path through every macro involved,
+`states.A: macro "Tower": body.on_enter[0]: unknown macro "Emit"`, each key as a
+document writes it. What it quotes of a document is cut to 32 bytes and a path
+to 64 steps, so an error stays small whatever the document.
 
 ## Deliberate subset and deviations
 

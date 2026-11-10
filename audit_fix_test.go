@@ -271,8 +271,8 @@ func TestParser_ArrayTableDelimitersAdjacent(t *testing.T) {
 	}
 }
 
-// Errors stay small and never carry a string's content, which may be a
-// secret (a verifier in a credentials file)
+// Errors stay small, a long key or literal cut, and never carry a string's
+// content, which may be a secret (a verifier in a credentials file)
 func TestErrorsBoundedWithoutStringContent(t *testing.T) {
 	for _, doc := range []string{`stored_key "SECRETVALUE"`, `password = SECRETVALUE`} {
 		_, err := NewParser([]byte(doc + "\n")).Parse()
@@ -280,9 +280,15 @@ func TestErrorsBoundedWithoutStringContent(t *testing.T) {
 			t.Fatalf("value content in error: %v", err)
 		}
 	}
-	_, err := NewParser([]byte("n = 1" + strings.Repeat("0", 1<<20) + "\n")).Parse()
-	if err == nil || len(err.Error()) > 200 {
-		t.Fatalf("error of %d bytes", len(err.Error()))
+	long := strings.Repeat("k", 1<<20)
+	for _, doc := range []string{"n = 1" + strings.Repeat("0", 1<<20), long + " = 1\n" + long + " = 2", long + " = 1\n" + long + ".x = 2"} {
+		_, err := NewParser([]byte(doc + "\n")).Parse()
+		if err == nil || len(err.Error()) > 200 {
+			t.Fatalf("error of %d bytes", len(fmt.Sprint(err)))
+		}
+	}
+	if _, err := Marshal(map[string]any{long: make(chan int)}); err == nil || len(err.Error()) > 200 {
+		t.Fatalf("error of %d bytes", len(fmt.Sprint(err)))
 	}
 }
 

@@ -239,6 +239,7 @@ func decodeStruct(data map[string]any, val reflect.Value, depth int) error {
 type field struct {
 	index     int
 	key       string // the tag's name, else the Go name
+	typ       reflect.Type
 	omitempty bool
 }
 
@@ -257,7 +258,7 @@ func fieldsOf(t reflect.Type) []field {
 		if !f.IsExported() || name == "-" {
 			continue
 		}
-		x := field{index: i, key: cmp.Or(name, f.Name)}
+		x := field{index: i, key: cmp.Or(name, f.Name), typ: f.Type}
 		for o := range strings.SplitSeq(opts, ",") {
 			x.omitempty = x.omitempty || o == "omitempty"
 		}

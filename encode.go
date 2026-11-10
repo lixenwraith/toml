@@ -88,7 +88,7 @@ func entries(v reflect.Value) ([]entry, error) {
 			return nil, err
 		}
 		if i > 0 && previous == x.name {
-			return nil, fmt.Errorf("duplicate TOML key %q", x.name)
+			return nil, fmt.Errorf("duplicate TOML key %s", brief(x.name))
 		}
 		previous = x.name
 		if x.value, err = indirect(x.value); err != nil {
@@ -122,7 +122,7 @@ func (e *encoder) table(v reflect.Value, prefix string, depth int) error {
 		e.buf.WriteString(x.key)
 		e.buf.WriteString(" = ")
 		if err := e.value(x.value, depth+1); err != nil {
-			return fmt.Errorf("key %q: %w", x.name, err)
+			return fmt.Errorf("key %s: %w", brief(x.name), err)
 		}
 		e.buf.WriteByte('\n')
 	}
@@ -252,7 +252,7 @@ func keyText(s string) (string, error) {
 		return "", fmt.Errorf("invalid UTF-8 key")
 	}
 	if numericKey(s) {
-		return "", fmt.Errorf("numeric keys are forbidden: %q", s)
+		return "", fmt.Errorf("numeric keys are forbidden: %s", brief(s))
 	}
 	if isBareKey(s) {
 		return s, nil

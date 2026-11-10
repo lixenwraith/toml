@@ -181,6 +181,27 @@ func (t *tables) child(k string) *tables {
 	return c
 }
 
+// at is the node of path under t, made if missing
+func (t *tables) at(path Key) *tables {
+	for _, k := range path {
+		t = t.child(k)
+	}
+	return t
+}
+
+// headedOver reports a header naming path or a table it is under
+func (t *tables) headedOver(path Key) bool {
+	for _, k := range path {
+		if t = t.sub[k]; t == nil {
+			return false
+		}
+		if t.headed {
+			return true
+		}
+	}
+	return false
+}
+
 // regroup gives each statement's piece to the section it is written in. A key
 // goes to the deepest table its path reaches that has a header, a reopened
 // header's keys to the first header; heads and lead go with the first piece of a

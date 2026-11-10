@@ -6,8 +6,10 @@
 package macro
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"math/bits"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,59 +22,152 @@ const (
 	keyEach   = "each"
 )
 
-// Bounds a peer-supplied document cannot exceed: invocation nesting, and the
-// values every expansion through one Set may produce together.
+// DefaultMaxValues bounds the values the expansions through one Set write.
+const DefaultMaxValues = 1 << 18
+
+// Bounds no document can exceed: invocation nesting, the nesting of a result,
+// which is what Decode and Marshal take, and a macro's parameters, which an
+// invocation flags in one word.
 const (
-	maxDepth = 32
-	maxNodes = 1 << 18
+	maxDepth   = 32
+	maxNesting = 1000
+	maxParams  = 64
+	maxSteps   = 64 // steps of a path an error spells
 )
 
-var errDefinitions = errors.New("[macros] is not allowed in this document")
+var (
+	errDefinitions = errors.New("[macros] is not allowed in this document")
+	errEach        = errors.New("each must be a table of parameter = array")
+	errEachValue   = errors.New("each expands only inside an array")
+	errNesting     = fmt.Errorf("nests deeper than %d", maxNesting)
+)
 
-// Parameter types an argument is checked against. A float parameter takes an
+// kind is a parameter's type, and what a value is. A float parameter takes an
 // integer too, as the decoder does.
+type kind uint8
+
 const (
-	typeAny    = "any"
-	typeArray  = "array"
-	typeBool   = "bool"
-	typeFloat  = "float"
-	typeInt    = "int"
-	typeString = "string"
-	typeTable  = "table"
+	kindAny kind = iota
+	kindArray
+	kindBool
+	kindFloat
+	kindInt
+	kindString
+	kindTable
+	kindOther // a Go value no document holds: only an any parameter takes it
 )
 
-var paramTypes = []string{typeAny, typeArray, typeBool, typeFloat, typeInt, typeString, typeTable}
+var kindNames = [...]string{"any", "array", "bool", "float", "int", "string", "table"}
+
+func kindOf(v any) kind {
+	switch v.(type) {
+	case int64, int, int8, int16, int32, uint, uint8, uint16, uint32, uint64:
+		return kindInt
+	case float64, float32:
+		return kindFloat
+	case bool:
+		return kindBool
+	case string:
+		return kindString
+	case map[string]any:
+		return kindTable
+	case []any, []map[string]any:
+		return kindArray
+	}
+	return kindOther
+}
+
+func kindName(v any) string {
+	if k := kindOf(v); k != kindOther {
+		return kindNames[k]
+	}
+	return fmt.Sprintf("%T", v)
+}
+
+func (k kind) holds(v any) bool {
+	got := kindOf(v)
+	return k == kindAny || k == got || k == kindFloat && got == kindInt
+}
 
 type param struct {
-	typ      string
-	def      any
-	optional bool
+	kind  kind
+	value any  // the default as written
+	def   node // the default, which may invoke
 }
 
+// macro is a definition compiled once. Its parameters are sorted by name, and a
+// parameter's index is its slot in an invocation's arguments.
 type macro struct {
-	params map[string]param
-	body   any
+	name     string
+	names    []string // the parameters' names
+	params   []param
+	required uint64 // slots with no default
+	body     node
 }
 
-// Set holds the macros a group of documents may invoke.
+func (m *macro) slot(name string) (int, bool) { return slices.BinarySearch(m.names, name) }
+
+type op uint8
+
+const (
+	opValue  op = iota // a scalar
+	opStatic           // a table or array nothing is substituted in: copied
+	opArg              // "${name}": the argument itself
+	opText             // text around references
+	opArray
+	opTable
+	opInvoke // a table holding the macro key: elems are its name, then its each
+)
+
+// node is a value of a body as an invocation instantiates it; size and height
+// are a static one's values and nesting
+type node struct {
+	op      op
+	dynamic bool // opTable: a key is spelled from arguments
+	slot    int
+	size    int
+	height  int
+	value   any
+	segs    []segment
+	elems   []node
+	fields  []field // sorted by key as written
+}
+
+type field struct {
+	key  string
+	segs []segment // a key spelled from arguments
+	node node
+}
+
+type segment struct {
+	text string
+	slot int // the parameter spliced in, -1 for text
+}
+
+// Set holds the macros a group of documents may invoke. The zero value is an
+// empty set; a set is not for concurrent use.
 type Set struct {
-	macros map[string]*macro
-	nodes  int // values substitution has produced, across every Expand
+	// MaxValues bounds the values every Expand through the set may write
+	// together; 0 means DefaultMaxValues
+	MaxValues int
+	macros    map[string]*macro
+	spent     int
 }
 
-func NewSet() *Set { return &Set{macros: make(map[string]*macro)} }
+func NewSet() *Set { return &Set{} }
 
 // ExpandDocument expands a document that defines its own macros.
 func ExpandDocument(doc map[string]any) (map[string]any, error) {
-	s := NewSet()
+	var s Set
 	if err := s.Define(doc); err != nil {
 		return nil, err
 	}
 	return s.Expand(doc)
 }
 
-// Define moves doc's [macros] into the set. A name defined twice is an error
-// across documents too, so a library cannot silently shadow its user.
+// Define moves doc's [macros] into the set, which keeps them. A name defined
+// twice is an error across documents too, so a library cannot silently shadow
+// its user.
 func (s *Set) Define(doc map[string]any) error {
 	raw, ok := doc[keyMacros]
 	if !ok {
@@ -83,27 +178,30 @@ func (s *Set) Define(doc map[string]any) error {
 	if !ok {
 		return errors.New("macros must be a table")
 	}
+	if s.macros == nil {
+		s.macros = make(map[string]*macro)
+	}
 	for _, name := range sortedKeys(table) {
 		if _, dup := s.macros[name]; dup {
-			return fmt.Errorf("macro %q is defined twice", name)
+			return fmt.Errorf("macro %s is defined twice", quote(name))
 		}
-		m, err := define(table[name])
+		m, err := define(name, table[name])
 		if err != nil {
-			return fmt.Errorf("macro %q: %w", name, err)
+			return fmt.Errorf("macro %s: %w", quote(name), err)
 		}
 		s.macros[name] = m
 	}
 	return nil
 }
 
-func define(raw any) (*macro, error) {
+func define(name string, raw any) (*macro, error) {
 	def, ok := raw.(map[string]any)
 	if !ok {
 		return nil, errors.New("definition must be a table")
 	}
 	for _, key := range sortedKeys(def) {
 		if !slices.Contains([]string{"body", "defaults", "doc", "params"}, key) {
-			return nil, fmt.Errorf("unknown key %q", key)
+			return nil, fmt.Errorf("unknown key %s", quote(key))
 		}
 	}
 	if _, ok := def["doc"].(string); def["doc"] != nil && !ok {
@@ -113,366 +211,106 @@ func define(raw any) (*macro, error) {
 	if !ok {
 		return nil, errors.New("body is missing")
 	}
-	m := &macro{params: make(map[string]param), body: body}
-
 	params, ok := def["params"].(map[string]any)
-	if def["params"] != nil && !ok {
+	switch {
+	case def["params"] != nil && !ok:
 		return nil, errors.New("params must be a table of name = type")
+	case len(params) > maxParams:
+		return nil, fmt.Errorf("more than %d parameters", maxParams)
 	}
-	for _, name := range sortedKeys(params) {
-		typ, _ := params[name].(string)
+	m := &macro{name: name, names: sortedKeys(params), params: make([]param, len(params))}
+	for slot, key := range m.names {
+		typ, _ := params[key].(string)
+		k := slices.Index(kindNames[:], typ)
 		switch {
-		case !validName(name) || name == keyInvoke || name == keyEach:
-			return nil, fmt.Errorf("parameter %q: not a usable name", name)
-		case !slices.Contains(paramTypes, typ):
-			return nil, fmt.Errorf("parameter %q: type must be one of %s", name, strings.Join(paramTypes, ", "))
+		case !validName(key) || key == keyInvoke || key == keyEach:
+			return nil, fmt.Errorf("parameter %s: not a usable name", quote(key))
+		case k < 0:
+			return nil, fmt.Errorf("parameter %s: type must be one of %s", quote(key), strings.Join(kindNames[:], ", "))
 		}
-		m.params[name] = param{typ: typ}
+		m.params[slot].kind = kind(k)
 	}
+	m.required = 1<<len(m.params) - 1
 
 	defaults, ok := def["defaults"].(map[string]any)
 	if def["defaults"] != nil && !ok {
 		return nil, errors.New("defaults must be a table")
 	}
-	for _, name := range sortedKeys(defaults) {
-		p, ok := m.params[name]
+	c := compiler{m: m}
+	for _, key := range sortedKeys(defaults) {
+		slot, ok := m.slot(key)
 		if !ok {
-			return nil, fmt.Errorf("default for undeclared parameter %q", name)
+			return nil, fmt.Errorf("default for undeclared parameter %s", quote(key))
 		}
-		if !typeHolds(p.typ, defaults[name]) {
-			return nil, fmt.Errorf("default for %q: want %s, got %s", name, p.typ, kindOf(defaults[name]))
+		p := &m.params[slot]
+		if !p.kind.holds(defaults[key]) {
+			return nil, fmt.Errorf("default for %s: want %s, got %s", quote(key), kindNames[p.kind], kindName(defaults[key]))
 		}
-		p.def, p.optional = defaults[name], true
-		m.params[name] = p
+		n, _, err := c.compile(defaults[key], 0)
+		if err != nil {
+			return nil, at(at(err, key), "defaults")
+		}
+		p.value, p.def = defaults[key], n
+		m.required &^= 1 << slot
 	}
 
 	// A reference to an undeclared parameter is a typo; catch it before any use
-	if err := m.checkReferences(body, "body"); err != nil {
-		return nil, err
+	c.template = true
+	n, _, err := c.compile(body, 0)
+	if err != nil {
+		return nil, at(err, "body")
 	}
+	m.body = n
 	return m, nil
 }
 
-func (m *macro) checkReferences(v any, path string) error {
-	check := func(s, path string) error {
-		segs, err := parseTemplate(s)
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		for _, seg := range segs {
-			if _, ok := m.params[seg.text]; seg.ref && !ok {
-				return fmt.Errorf("%s: undeclared parameter %q", path, seg.text)
-			}
-		}
-		return nil
-	}
-	if s, ok := v.(string); ok {
-		return check(s, path)
-	}
-	if t, ok := v.(map[string]any); ok {
-		for _, k := range sortedKeys(t) {
-			if err := check(k, join(path, k)); err != nil {
-				return err
-			}
-			if err := m.checkReferences(t[k], join(path, k)); err != nil {
-				return err
-			}
-		}
-	}
-	list, _ := elements(v)
-	for i, el := range list {
-		if err := m.checkReferences(el, index(path, i)); err != nil {
-			return err
-		}
-	}
-	return nil
+// compiler reads a macro's body into the template its invocations instantiate,
+// or a default, whose text is not a template
+type compiler struct {
+	m        *macro
+	template bool
 }
 
-// Expand returns doc with every invocation replaced; doc itself is not modified.
-// Arrays come back as []any, whatever form the parser gave them.
-func (s *Set) Expand(doc map[string]any) (map[string]any, error) {
-	if _, ok := doc[keyMacros]; ok {
-		return nil, errDefinitions
-	}
-	e := &expander{set: s}
-	out, err := e.value(doc, "")
-	if err != nil {
-		return nil, err
-	}
-	table, ok := out.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("document expands to a %s, not a table", kindOf(out))
-	}
-	return table, nil
-}
-
-type expander struct {
-	set   *Set
-	stack []string // macros being expanded, outermost first
-}
-
-// value copies v, replacing invocations. In an array, an expansion that is
-// itself an array is spliced in, and so is each result of an each.
-func (e *expander) value(v any, path string) (any, error) {
-	if list, ok := elements(v); ok {
-		out := make([]any, 0, len(list))
-		for i, el := range list {
-			inv, ok := el.(map[string]any)
-			if _, invokes := inv[keyInvoke]; !ok || !invokes {
-				x, err := e.value(el, index(path, i))
-				if err != nil {
-					return nil, err
-				}
-				out = append(out, x)
-				continue
-			}
-			results, err := e.invoke(inv, index(path, i))
-			if err != nil {
-				return nil, err
-			}
-			for _, r := range results {
-				if spliced, ok := r.([]any); ok {
-					out = append(out, spliced...)
-				} else {
-					out = append(out, r)
-				}
-			}
-		}
-		return out, nil
-	}
-	t, ok := v.(map[string]any)
-	if !ok {
-		return v, nil
-	}
-	if _, ok := t[keyInvoke]; ok {
-		if _, each := t[keyEach]; each {
-			return nil, fmt.Errorf("%s: each expands only inside an array", at(path))
-		}
-		results, err := e.invoke(t, path)
-		if err != nil {
-			return nil, err
-		}
-		return results[0], nil
-	}
-	out := make(map[string]any, len(t))
-	for _, k := range sortedKeys(t) {
-		x, err := e.value(t[k], join(path, k))
-		if err != nil {
-			return nil, err
-		}
-		out[k] = x
-	}
-	return out, nil
-}
-
-// invoke binds one invocation's arguments and expands its body once, or once
-// per element of the arrays its each table names, zipped.
-func (e *expander) invoke(inv map[string]any, path string) ([]any, error) {
-	name, ok := inv[keyInvoke].(string)
-	if !ok {
-		return nil, fmt.Errorf("%s: macro name must be a string", at(path))
-	}
-	m, ok := e.set.macros[name]
-	switch {
-	case !ok:
-		return nil, fmt.Errorf("%s: unknown macro %q", at(path), name)
-	case slices.Contains(e.stack, name):
-		return nil, fmt.Errorf("%s: macro %q invokes itself through %s", at(path), name, strings.Join(e.stack, " → "))
-	case len(e.stack) >= maxDepth:
-		return nil, fmt.Errorf("%s: macros nest deeper than %d", at(path), maxDepth)
-	}
-	fail := func(err error) ([]any, error) { return nil, fmt.Errorf("%s: macro %q: %w", at(path), name, err) }
-
-	// Arguments are expanded where they are written, before binding
-	args := make(map[string]any, len(m.params))
-	for _, k := range sortedKeys(inv) {
-		if k == keyInvoke || k == keyEach {
-			continue
-		}
-		p, ok := m.params[k]
-		if !ok {
-			return fail(fmt.Errorf("unknown argument %q", k))
-		}
-		v, err := e.value(inv[k], join(path, k))
-		if err != nil {
-			return nil, err
-		}
-		if !typeHolds(p.typ, v) {
-			return fail(fmt.Errorf("argument %q: want %s, got %s", k, p.typ, kindOf(v)))
-		}
-		args[k] = v
-	}
-	each, count, err := e.eachArgs(inv, m, args, join(path, keyEach))
-	if err != nil {
-		return fail(err)
-	}
-	for _, k := range sortedKeys(m.params) {
-		_, given := args[k]
-		_, iterated := each[k]
-		switch p := m.params[k]; {
-		case given || iterated:
-		case p.optional:
-			args[k] = p.def
-		default:
-			return fail(fmt.Errorf("missing argument %q", k))
-		}
-	}
-
-	e.stack = append(e.stack, name)
-	defer func() { e.stack = e.stack[:len(e.stack)-1] }()
-	results := make([]any, 0, count)
-	for i := range count {
-		for _, k := range sortedKeys(each) {
-			args[k] = each[k][i]
-		}
-		body, err := e.subst(m.body, args, "body")
-		if err != nil {
-			return fail(err)
-		}
-		out, err := e.value(body, "body")
-		if err != nil {
-			return fail(err)
-		}
-		results = append(results, out)
-	}
-	return results, nil
-}
-
-// eachArgs reads an invocation's each table: parameter = array, all one length.
-// Without one, the body expands once.
-func (e *expander) eachArgs(inv map[string]any, m *macro, args map[string]any, path string) (map[string][]any, int, error) {
-	raw, ok := inv[keyEach]
-	if !ok {
-		return nil, 1, nil
-	}
-	expanded, err := e.value(raw, path)
-	if err != nil {
-		return nil, 0, err
-	}
-	table, ok := expanded.(map[string]any)
-	if !ok || len(table) == 0 {
-		return nil, 0, errors.New("each must be a table of parameter = array")
-	}
-	each, count := make(map[string][]any, len(table)), -1
-	for _, k := range sortedKeys(table) {
-		p, declared := m.params[k]
-		_, given := args[k]
-		list, isArray := table[k].([]any)
-		switch {
-		case !declared:
-			return nil, 0, fmt.Errorf("each: unknown argument %q", k)
-		case given:
-			return nil, 0, fmt.Errorf("each: argument %q is also given directly", k)
-		case !isArray:
-			return nil, 0, fmt.Errorf("each: argument %q must be an array", k)
-		case count >= 0 && len(list) != count:
-			return nil, 0, fmt.Errorf("each: argument %q has %d elements, the others %d", k, len(list), count)
-		}
-		for i, v := range list {
-			if !typeHolds(p.typ, v) {
-				return nil, 0, fmt.Errorf("each: argument %q[%d]: want %s, got %s", k, i, p.typ, kindOf(v))
-			}
-		}
-		each[k], count = list, len(list)
-	}
-	return each, count, nil
-}
-
-// subst copies v with ${name} replaced. A string that is one reference becomes
-// the argument itself, of any type; elsewhere an argument is spliced into the
-// text and must be a string, an integer or a boolean. Nil args copies v verbatim,
-// which is how an argument is copied: its text is never a template.
-func (e *expander) subst(v any, args map[string]any, path string) (any, error) {
-	if e.set.nodes++; e.set.nodes > maxNodes {
-		return nil, fmt.Errorf("expansion exceeds %d values", maxNodes)
-	}
-	template := func(s, path string) ([]segment, error) {
-		if args == nil {
-			return []segment{{text: s}}, nil
-		}
-		segs, err := parseTemplate(s)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
-		}
-		return segs, nil
-	}
-	if list, ok := elements(v); ok {
-		out := make([]any, len(list))
-		for i, el := range list {
-			x, err := e.subst(el, args, index(path, i))
-			if err != nil {
-				return nil, err
-			}
-			out[i] = x
-		}
-		return out, nil
+// compile reads v. plain reports a node that is v as written, so that the value
+// holding it can stay one static node.
+func (c *compiler) compile(v any, depth int) (n node, plain bool, err error) {
+	if depth > maxNesting {
+		return n, false, errNesting
 	}
 	switch v := v.(type) {
 	case string:
-		segs, err := template(v, path)
-		if err != nil {
-			return nil, err
+		if c.template && strings.Contains(v, "$") {
+			return c.text(v)
 		}
-		if len(segs) == 1 && segs[0].ref {
-			// Every use gets its own copy, so a consumer editing one cannot reach another
-			return e.subst(args[segs[0].text], nil, path)
-		}
-		return interpolate(segs, args, path)
 	case map[string]any:
-		out := make(map[string]any, len(v))
-		for _, k := range sortedKeys(v) {
-			segs, err := template(k, join(path, k))
-			if err != nil {
-				return nil, err
-			}
-			key, err := interpolate(segs, args, join(path, k))
-			if err != nil {
-				return nil, err
-			}
-			if _, dup := out[key]; dup {
-				return nil, fmt.Errorf("%s: key %q appears twice after substitution", join(path, k), key)
-			}
-			if out[key], err = e.subst(v[k], args, join(path, k)); err != nil {
-				return nil, err
-			}
+		return c.table(v, depth, false)
+	case []map[string]any:
+		list := make([]any, len(v))
+		for i, t := range v {
+			list[i] = t
 		}
-		return out, nil
-	default:
-		return v, nil
+		return c.array(list, depth)
+	case []any:
+		return c.array(v, depth)
 	}
+	return node{op: opValue, value: v, size: 1}, true, nil
 }
 
-func interpolate(segs []segment, args map[string]any, path string) (string, error) {
-	var b strings.Builder
-	for _, seg := range segs {
-		if !seg.ref {
-			b.WriteString(seg.text)
-			continue
-		}
-		switch v := args[seg.text].(type) {
-		case string:
-			b.WriteString(v)
-		case int64:
-			b.WriteString(strconv.FormatInt(v, 10))
-		case bool:
-			b.WriteString(strconv.FormatBool(v))
-		default:
-			return "", fmt.Errorf("%s: %s argument %q cannot be part of a string", path, kindOf(v), seg.text)
-		}
+func (c *compiler) text(s string) (node, bool, error) {
+	segs, err := c.parse(s)
+	switch {
+	case err != nil:
+		return node{}, false, err
+	case len(segs) > 1:
+		return node{op: opText, segs: segs}, false, nil
+	case segs[0].slot < 0:
+		return node{op: opValue, value: segs[0].text, size: 1}, false, nil
 	}
-	return b.String(), nil
+	return node{op: opArg, slot: segs[0].slot}, false, nil
 }
 
-type segment struct {
-	text string
-	ref  bool // text names a parameter
-}
-
-// parseTemplate splits s into literal text and ${name} references; $$ is a literal $.
-func parseTemplate(s string) ([]segment, error) {
-	if !strings.Contains(s, "$") {
-		return []segment{{text: s}}, nil
-	}
+// parse splits a template into text and ${name} references; $$ is a literal $
+func (c *compiler) parse(s string) ([]segment, error) {
 	var segs []segment
 	var lit strings.Builder
 	for i := 0; i < len(s); {
@@ -490,22 +328,806 @@ func parseTemplate(s string) ([]segment, error) {
 			}
 			name := s[i+2 : i+end]
 			if !validName(name) {
-				return nil, fmt.Errorf("${%s} does not name a parameter", name)
+				return nil, fmt.Errorf("%s does not name a parameter", quote(s[i:i+end+1]))
+			}
+			slot, ok := c.m.slot(name)
+			if !ok {
+				return nil, fmt.Errorf("undeclared parameter %s", quote(name))
 			}
 			if lit.Len() > 0 {
-				segs = append(segs, segment{text: lit.String()})
+				segs = append(segs, segment{text: lit.String(), slot: -1})
 				lit.Reset()
 			}
-			segs = append(segs, segment{text: name, ref: true})
+			segs = append(segs, segment{slot: slot})
 			i += end + 1
 		default:
 			return nil, errors.New("a literal $ is written $$")
 		}
 	}
 	if lit.Len() > 0 || len(segs) == 0 {
-		segs = append(segs, segment{text: lit.String()})
+		segs = append(segs, segment{text: lit.String(), slot: -1})
 	}
 	return segs, nil
+}
+
+// table reads a table: an invocation when it holds the macro key, one static
+// node when nothing in it is substituted, unless keep asks for its fields
+func (c *compiler) table(t map[string]any, depth int, keep bool) (node, bool, error) {
+	keys := sortedKeys(t)
+	_, invokes := t[keyInvoke]
+	n := node{op: opTable, size: 1}
+	if invokes || keep {
+		n.fields = make([]field, len(keys))
+	}
+	for i, k := range keys {
+		f := field{key: k}
+		plain := true
+		if c.template && strings.Contains(k, "$") {
+			segs, err := c.parse(k)
+			if err != nil {
+				return n, false, at(err, k)
+			}
+			if plain = false; len(segs) == 1 && segs[0].slot < 0 {
+				f.key = segs[0].text
+			} else {
+				f.segs, n.dynamic = segs, true
+			}
+		}
+		var same bool
+		var err error
+		if lists, ok := t[k].(map[string]any); ok && k == keyEach && invokes {
+			f.node, same, err = c.table(lists, depth+1, true)
+		} else {
+			f.node, same, err = c.compile(t[k], depth+1)
+		}
+		if err != nil {
+			return n, false, at(err, k)
+		}
+		if f.node.op == opStatic {
+			t[k] = f.node.value // an array of tables now reads as an array
+		}
+		if !(plain && same) && n.fields == nil {
+			n.fields = make([]field, len(keys))
+			for j, prev := range keys[:i] {
+				n.fields[j] = field{key: prev, node: static(t[prev])}
+			}
+		}
+		if n.fields != nil {
+			n.fields[i] = f
+		}
+		n.size, n.height = n.size+f.node.size, max(n.height, f.node.height)
+	}
+	n.height++
+	switch {
+	case invokes && !n.dynamic:
+		return invocation(n.fields), false, nil
+	case n.fields == nil:
+		return node{op: opStatic, value: t, size: n.size, height: n.height}, true, nil
+	}
+	return n, false, nil
+}
+
+// invocation is a table holding the macro key: its name, its each table, and
+// the fields that are its arguments
+func invocation(fields []field) node {
+	n := node{op: opInvoke, elems: make([]node, 1, 2)}
+	for _, f := range fields {
+		switch f.key {
+		case keyInvoke:
+			n.elems[0] = f.node
+		case keyEach:
+			n.elems = append(n.elems, f.node)
+		default:
+			n.fields = append(n.fields, f)
+		}
+	}
+	return n
+}
+
+func (c *compiler) array(a []any, depth int) (node, bool, error) {
+	n := node{op: opArray, size: 1}
+	for i, el := range a {
+		sub, plain, err := c.compile(el, depth+1)
+		if err != nil {
+			return n, false, atIndex(err, i)
+		}
+		if sub.op == opStatic {
+			a[i] = sub.value
+		}
+		if !plain && n.elems == nil {
+			n.elems = make([]node, len(a))
+			for j, prev := range a[:i] {
+				n.elems[j] = static(prev)
+			}
+		}
+		if n.elems != nil {
+			n.elems[i] = sub
+		}
+		n.size, n.height = n.size+sub.size, max(n.height, sub.height)
+	}
+	n.height++
+	if n.elems == nil {
+		return node{op: opStatic, value: a, size: n.size, height: n.height}, true, nil
+	}
+	return n, false, nil
+}
+
+// static is the node of a value compile found plain
+func static(v any) node {
+	n := node{op: opValue, value: v}
+	if n.size, n.height = measure(v); n.height > 0 {
+		n.op = opStatic
+	}
+	return n
+}
+
+// measure is the values in v and its nesting, 0 for a scalar
+func measure(v any) (size, height int) {
+	size = 1
+	switch v := v.(type) {
+	case map[string]any:
+		for _, x := range v {
+			s, h := measure(x)
+			size, height = size+s, max(height, h)
+		}
+	case []any:
+		for _, x := range v {
+			s, h := measure(x)
+			size, height = size+s, max(height, h)
+		}
+	default:
+		return 1, 0
+	}
+	return size, height + 1
+}
+
+// Expand returns doc with every invocation replaced. doc is not modified, and
+// the result shares no table or array with it or with the set. Arrays come back
+// as []any, whatever form the parser gave them.
+func (s *Set) Expand(doc map[string]any) (map[string]any, error) {
+	if _, ok := doc[keyMacros]; ok {
+		return nil, errDefinitions
+	}
+	e := expander{set: s, limit: cmp.Or(s.MaxValues, DefaultMaxValues)}
+	out, _, err := e.walk(doc, 0)
+	if err != nil {
+		if _, ok := err.(*pathError); !ok {
+			err = &pathError{err: err}
+		}
+		return nil, err
+	}
+	table, ok := out.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("document expands to a %s, not a table", kindName(out))
+	}
+	return table, nil
+}
+
+type expander struct {
+	set   *Set
+	limit int
+	stack []string // macros being expanded, outermost first
+	args  []arg    // the arguments of the invocations being expanded, a call each
+	keys  []string // the sorted keys of the tables being read, a run each
+}
+
+// arg is an argument and its nesting, 0 for a scalar
+type arg struct {
+	v any
+	h int
+}
+
+// call is one invocation: its arguments are e.args[base+slot], and the lists
+// of its each follow them, in slot order
+type call struct {
+	m     *macro
+	base  int
+	count int    // times the body is instantiated
+	given uint64 // slots holding an argument; the rest take their default
+	each  uint64 // slots bound per element of a list
+}
+
+func (e *expander) spend(n int) error {
+	if n > e.limit-e.set.spent {
+		e.set.spent = max(e.set.spent, e.limit)
+		return fmt.Errorf("expansion exceeds %d values", e.limit)
+	}
+	e.set.spent += n
+	return nil
+}
+
+// sorted puts t's keys, sorted, on e.keys and returns where they start. They
+// are read by index, since a table under t moves the slice, and cut off after.
+func (e *expander) sorted(t map[string]any) int {
+	base := len(e.keys)
+	for k := range t {
+		e.keys = append(e.keys, k)
+	}
+	slices.Sort(e.keys[base:])
+	return base
+}
+
+// walk copies v, a value of a document, for depth d of the result, with every
+// invocation in it expanded; h is the copy's nesting
+func (e *expander) walk(v any, d int) (out any, h int, err error) {
+	switch v := v.(type) {
+	case map[string]any:
+		if _, ok := v[keyInvoke]; ok {
+			return e.invokeRaw(v, d, false, nil)
+		}
+		if d >= maxNesting {
+			return nil, 0, errNesting
+		}
+		out := make(map[string]any, len(v))
+		base := e.sorted(v)
+		for i := base; i < base+len(v); i++ {
+			k := e.keys[i]
+			x, xh, err := e.walk(v[k], d+1)
+			if err != nil {
+				return nil, 0, at(err, k)
+			}
+			out[k], h = x, max(h, xh)
+		}
+		e.keys = e.keys[:base]
+		return out, h + 1, nil
+	case []any:
+		if d >= maxNesting {
+			return nil, 0, errNesting
+		}
+		out := make([]any, 0, len(v))
+		for i, el := range v {
+			if out, h, err = e.element(el, i, d, out, h); err != nil {
+				return nil, 0, err
+			}
+		}
+		return out, h + 1, nil
+	case []map[string]any:
+		if d >= maxNesting {
+			return nil, 0, errNesting
+		}
+		out := make([]any, 0, len(v))
+		for i, el := range v {
+			if out, h, err = e.element(el, i, d, out, h); err != nil {
+				return nil, 0, err
+			}
+		}
+		return out, h + 1, nil
+	}
+	return v, 0, nil
+}
+
+// element appends an array's element i to out, expanded: an invocation's
+// results, an array among them spliced in, or the element itself
+func (e *expander) element(el any, i, d int, out []any, h int) ([]any, int, error) {
+	if t, ok := el.(map[string]any); ok {
+		if _, ok := t[keyInvoke]; ok {
+			_, xh, err := e.invokeRaw(t, d+1, false, &out)
+			return out, max(h, xh), atIndex(err, i)
+		}
+	}
+	x, xh, err := e.walk(el, d+1)
+	return append(out, x), max(h, xh), atIndex(err, i)
+}
+
+// open finds the macro an invocation names
+func (e *expander) open(name any) (*macro, error) {
+	s, ok := name.(string)
+	if !ok {
+		return nil, errors.New("macro name must be a string")
+	}
+	m := e.set.macros[s]
+	switch {
+	case m == nil:
+		return nil, fmt.Errorf("unknown macro %s", quote(s))
+	case slices.Contains(e.stack, s):
+		chain := make([]string, len(e.stack))
+		for i, name := range e.stack {
+			chain[i] = spell(name)
+		}
+		return nil, fmt.Errorf("macro %s invokes itself through %s", quote(s), strings.Join(chain, " → "))
+	case len(e.stack) >= maxDepth:
+		return nil, fmt.Errorf("macros nest deeper than %d", maxDepth)
+	}
+	return m, nil
+}
+
+func (e *expander) push(m *macro) call {
+	base := len(e.args)
+	e.args = append(e.args, make([]arg, len(m.params))...)
+	return call{m: m, base: base, count: 1}
+}
+
+// invokeRaw expands the invocation a table is, in a document or once a body's
+// keys are spelled: expanded says its values already are. As an array's element
+// it appends its results to dst; as a value it gives one.
+func (e *expander) invokeRaw(inv map[string]any, d int, expanded bool, dst *[]any) (any, int, error) {
+	lists, iterated := inv[keyEach]
+	if iterated && dst == nil {
+		return nil, 0, errEachValue
+	}
+	m, err := e.open(inv[keyInvoke])
+	if err != nil {
+		return nil, 0, err
+	}
+	// Arguments are expanded where they are written, before binding
+	c := e.push(m)
+	base := e.sorted(inv)
+	for i := base; i < base+len(inv); i++ {
+		k := e.keys[i]
+		if k == keyInvoke || k == keyEach {
+			continue
+		}
+		slot, ok := m.slot(k)
+		if !ok {
+			return nil, 0, in(fmt.Errorf("unknown argument %s", quote(k)), m.name)
+		}
+		v, h := inv[k], 0
+		if expanded {
+			_, h = measure(v)
+		} else if v, h, err = e.walk(v, d); err != nil {
+			return nil, 0, at(err, k)
+		}
+		if err := e.put(&c, slot, v, h); err != nil {
+			return nil, 0, in(err, m.name)
+		}
+	}
+	e.keys = e.keys[:base]
+	if iterated {
+		h := 0
+		if expanded {
+			_, h = measure(lists)
+		} else if lists, h, err = e.walk(lists, d); err != nil {
+			return nil, 0, at(err, keyEach)
+		}
+		if err := e.lists(&c, lists, h); err != nil {
+			return nil, 0, in(err, m.name)
+		}
+	}
+	return e.run(&c, d, dst)
+}
+
+// invokeNode expands an invocation a body holds. An argument that is a
+// reference or static is lent to the macro invoked, which copies what it places.
+func (e *expander) invokeNode(n *node, f *call, d int, dst *[]any) (any, int, error) {
+	if len(n.elems) > 1 && dst == nil {
+		return nil, 0, errEachValue
+	}
+	name, _, err := e.inst(&n.elems[0], f, d)
+	if err != nil {
+		return nil, 0, at(err, keyInvoke)
+	}
+	m, err := e.open(name)
+	if err != nil {
+		return nil, 0, err
+	}
+	c := e.push(m)
+	for i := range n.fields {
+		fld := &n.fields[i]
+		slot, ok := m.slot(fld.key)
+		if !ok {
+			return nil, 0, in(fmt.Errorf("unknown argument %s", quote(fld.key)), m.name)
+		}
+		v, h, err := e.pass(&fld.node, f, d)
+		if err != nil {
+			return nil, 0, at(err, fld.key)
+		}
+		if err := e.put(&c, slot, v, h); err != nil {
+			return nil, 0, in(err, m.name)
+		}
+	}
+	if len(n.elems) == 1 {
+		return e.run(&c, d, dst)
+	}
+	if each := &n.elems[1]; each.op == opTable && !each.dynamic && len(each.fields) > 0 {
+		for i := range each.fields {
+			fld := &each.fields[i]
+			v, h, err := e.pass(&fld.node, f, d)
+			if err != nil {
+				return nil, 0, at(at(err, fld.key), keyEach)
+			}
+			if err := e.list(&c, fld.key, v, h); err != nil {
+				return nil, 0, in(err, m.name)
+			}
+		}
+		return e.run(&c, d, dst)
+	}
+	lists, h, err := e.inst(&n.elems[1], f, d)
+	if err != nil {
+		return nil, 0, at(err, keyEach)
+	}
+	if err := e.lists(&c, lists, h); err != nil {
+		return nil, 0, in(err, m.name)
+	}
+	return e.run(&c, d, dst)
+}
+
+// pass is an argument for an invocation in a body: a reference or a static
+// value as it stands, lent, else a value made for it
+func (e *expander) pass(n *node, f *call, d int) (any, int, error) {
+	switch n.op {
+	case opArg:
+		return e.use(f, n.slot, d, false)
+	case opValue, opStatic:
+		return n.value, n.height, nil
+	}
+	return e.inst(n, f, d)
+}
+
+func (e *expander) put(c *call, slot int, v any, h int) error {
+	if k := c.m.params[slot].kind; !k.holds(v) {
+		return fmt.Errorf("argument %s: want %s, got %s", quote(c.m.names[slot]), kindNames[k], kindName(v))
+	}
+	e.args[c.base+slot] = arg{v, h}
+	c.given |= 1 << slot
+	return nil
+}
+
+// lists reads an each table, whose nesting is h: parameter = array, all one length
+func (e *expander) lists(c *call, v any, h int) error {
+	table, ok := v.(map[string]any)
+	if !ok || len(table) == 0 {
+		return errEach
+	}
+	base := e.sorted(table)
+	for i := base; i < base+len(table); i++ {
+		if err := e.list(c, e.keys[i], table[e.keys[i]], h-1); err != nil {
+			return err
+		}
+	}
+	e.keys = e.keys[:base]
+	return nil
+}
+
+// list binds one parameter of an each to its array. Keys arrive sorted, as
+// slots are, so the lists stand after the arguments in slot order.
+func (e *expander) list(c *call, key string, v any, h int) error {
+	slot, declared := c.m.slot(key)
+	if !declared {
+		return fmt.Errorf("each: unknown argument %s", quote(key))
+	}
+	list, isArray := v.([]any)
+	switch {
+	case c.given&(1<<slot) != 0:
+		return fmt.Errorf("each: argument %s is also given directly", quote(key))
+	case !isArray:
+		return fmt.Errorf("each: argument %s must be an array", quote(key))
+	case c.each != 0 && len(list) != c.count:
+		return fmt.Errorf("each: argument %s has %d elements, the others %d", quote(key), len(list), c.count)
+	}
+	for i, x := range list {
+		if k := c.m.params[slot].kind; !k.holds(x) {
+			return fmt.Errorf("each: argument %s[%d]: want %s, got %s", quote(key), i, kindNames[k], kindName(x))
+		}
+	}
+	e.args = append(e.args, arg{list, h})
+	c.each, c.count = c.each|1<<slot, len(list)
+	return nil
+}
+
+// run instantiates c's body once, or once per element of its lists, zipped, and
+// ends the call. In an array each result is appended to dst, an array spliced in.
+func (e *expander) run(c *call, d int, dst *[]any) (v any, h int, err error) {
+	m := c.m
+	if missing := m.required &^ (c.given | c.each); missing != 0 {
+		name := m.names[bits.TrailingZeros64(missing)]
+		return nil, 0, in(fmt.Errorf("missing argument %s", quote(name)), m.name)
+	}
+	c.given |= c.each
+	e.stack = append(e.stack, m.name)
+	for i := range c.count {
+		next := c.base + len(m.params)
+		for each := c.each; each != 0; each &= each - 1 {
+			l := e.args[next]
+			e.args[c.base+bits.TrailingZeros64(each)] = arg{l.v.([]any)[i], max(l.h-1, 0)}
+			next++
+		}
+		x, xh, err := e.inst(&m.body, c, d)
+		if err != nil {
+			return nil, 0, in(at(err, "body"), m.name)
+		}
+		list, splice := x.([]any)
+		switch {
+		case dst == nil:
+			v, h = x, xh
+		case splice:
+			*dst, h = append(*dst, list...), max(h, xh-1)
+		default:
+			*dst, h = append(*dst, x), max(h, xh)
+		}
+	}
+	e.stack = e.stack[:len(e.stack)-1]
+	clear(e.args[c.base:])
+	e.args = e.args[:c.base]
+	return v, h, nil
+}
+
+// use reads a parameter: its argument, else its default. For a place in the
+// result at depth d a table or array is copied, so no two places share one; for
+// another invocation it is lent as it stands.
+func (e *expander) use(c *call, slot, d int, place bool) (v any, h int, err error) {
+	if c.given&(1<<slot) != 0 {
+		a := e.args[c.base+slot]
+		v, h = a.v, a.h
+	} else if def := &c.m.params[slot].def; def.op == opValue || def.op == opStatic {
+		v, h = def.value, def.height
+	} else {
+		return e.inst(def, nil, d) // a default that invokes, expanded for this use
+	}
+	if !place {
+		return v, h, nil
+	}
+	if d+h > maxNesting {
+		return nil, 0, errNesting
+	}
+	n := 1
+	if h > 0 {
+		v, n = clone(v)
+	}
+	return v, h, e.spend(n)
+}
+
+// inst instantiates a body's node for one call, at depth d of the result
+func (e *expander) inst(n *node, c *call, d int) (any, int, error) {
+	switch n.op {
+	case opValue:
+		return n.value, 0, e.spend(1)
+	case opStatic:
+		if d+n.height > maxNesting {
+			return nil, 0, errNesting
+		}
+		if err := e.spend(n.size); err != nil {
+			return nil, 0, err
+		}
+		v, _ := clone(n.value)
+		return v, n.height, nil
+	case opArg:
+		return e.use(c, n.slot, d, true)
+	case opText:
+		s, err := e.text(n.segs, c)
+		if err != nil {
+			return nil, 0, err
+		}
+		return s, 0, e.spend(1)
+	case opArray:
+		return e.instArray(n, c, d)
+	case opTable:
+		t, h, err := e.instTable(n, c, d)
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, invokes := t[keyInvoke]; invokes && n.dynamic {
+			return e.invokeRaw(t, d, true, nil)
+		}
+		return t, h, nil
+	}
+	return e.invokeNode(n, c, d, nil)
+}
+
+func (e *expander) instArray(n *node, c *call, d int) (any, int, error) {
+	if d >= maxNesting {
+		return nil, 0, errNesting
+	}
+	if err := e.spend(1); err != nil {
+		return nil, 0, err
+	}
+	out, h := make([]any, 0, len(n.elems)), 0
+	for i := range n.elems {
+		var x any
+		var xh int
+		var err error
+		switch el := &n.elems[i]; {
+		case el.op == opInvoke:
+			_, xh, err = e.invokeNode(el, c, d+1, &out)
+		case el.op == opArg && c.given&(1<<el.slot) == 0 && c.m.params[el.slot].def.op == opInvoke:
+			// A default that invokes expands where it is used, here as an element
+			_, xh, err = e.invokeNode(&c.m.params[el.slot].def, nil, d+1, &out)
+		case el.op == opTable && el.dynamic:
+			var t map[string]any
+			if t, xh, err = e.instTable(el, c, d+1); err != nil {
+				break
+			}
+			if _, invokes := t[keyInvoke]; invokes {
+				_, xh, err = e.invokeRaw(t, d+1, true, &out)
+			} else {
+				out = append(out, t)
+			}
+		default:
+			if x, xh, err = e.inst(el, c, d+1); err == nil {
+				out = append(out, x)
+			}
+		}
+		if err != nil {
+			return nil, 0, atIndex(err, i)
+		}
+		h = max(h, xh)
+	}
+	return out, h + 1, nil
+}
+
+// instTable instantiates a table's fields. A key spelled from arguments is
+// checked against the others: two arguments may spell one key.
+func (e *expander) instTable(n *node, c *call, d int) (map[string]any, int, error) {
+	if d >= maxNesting {
+		return nil, 0, errNesting
+	}
+	if err := e.spend(1); err != nil {
+		return nil, 0, err
+	}
+	out, h := make(map[string]any, len(n.fields)), 0
+	for i := range n.fields {
+		f := &n.fields[i]
+		key := f.key
+		if f.segs != nil {
+			var err error
+			if key, err = e.text(f.segs, c); err != nil {
+				return nil, 0, at(err, f.key)
+			}
+		}
+		if _, dup := out[key]; dup && n.dynamic {
+			return nil, 0, at(fmt.Errorf("key %s appears twice after substitution", quote(key)), f.key)
+		}
+		v, vh, err := e.inst(&f.node, c, d+1)
+		if err != nil {
+			return nil, 0, at(err, f.key)
+		}
+		out[key], h = v, max(h, vh)
+	}
+	return out, h + 1, nil
+}
+
+// text splices arguments into a template's text: each a string, an integer or
+// a boolean
+func (e *expander) text(segs []segment, c *call) (string, error) {
+	var b strings.Builder
+	for i := range segs {
+		s := &segs[i]
+		if s.slot < 0 {
+			b.WriteString(s.text)
+			continue
+		}
+		v := c.m.params[s.slot].value
+		if c.given&(1<<s.slot) != 0 {
+			v = e.args[c.base+s.slot].v
+		}
+		switch v := v.(type) {
+		case string:
+			b.WriteString(v)
+		case int64:
+			b.WriteString(strconv.FormatInt(v, 10))
+		case bool:
+			b.WriteString(strconv.FormatBool(v))
+		default:
+			if kindOf(v) != kindInt {
+				return "", fmt.Errorf("%s argument %s cannot be part of a string", kindName(v), quote(c.m.names[s.slot]))
+			}
+			fmt.Fprint(&b, v)
+		}
+	}
+	return b.String(), nil
+}
+
+// clone copies v, arrays as []any, and counts the values in it
+func clone(v any) (any, int) {
+	n := 1
+	switch v := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, x := range v {
+			c, m := clone(x)
+			out[k], n = c, n+m
+		}
+		return out, n
+	case []any:
+		out := make([]any, len(v))
+		for i, x := range v {
+			c, m := clone(x)
+			out[i], n = c, n+m
+		}
+		return out, n
+	case []map[string]any:
+		out := make([]any, len(v))
+		for i, x := range v {
+			c, m := clone(x)
+			out[i], n = c, n+m
+		}
+		return out, n
+	}
+	return v, 1
+}
+
+// pathError is an error and where it happened, a step added by each value the
+// expansion leaves on its way out, so a path costs nothing until one is shown
+type pathError struct {
+	steps []step // innermost first
+	err   error
+}
+
+// step is a key, an array index when indexed, or the macro whose body the
+// steps inside it are in
+type step struct {
+	key     string
+	index   int
+	indexed bool
+	macro   bool
+}
+
+func (e *pathError) Unwrap() error { return e.err }
+
+// Error names the invocation path through every macro involved:
+// states.A: macro "M": body.on_enter[0]: unknown macro "N". A path of more than
+// maxSteps steps shows its outer and inner halves.
+func (e *pathError) Error() string {
+	var b strings.Builder
+	keys := 0 // steps of the path being spelled
+	for i := len(e.steps) - 1; i >= 0; i-- {
+		if cut := len(e.steps) - maxSteps; cut > 0 && i == len(e.steps)-maxSteps/2-1 {
+			b.WriteString(" ... ")
+			i, keys = maxSteps/2-1, 0
+		}
+		switch s := e.steps[i]; {
+		case s.macro:
+			if b.Len() == 0 {
+				b.WriteString("document")
+			}
+			b.WriteString(": macro " + quote(s.key) + ": ")
+			keys = 0
+		case s.indexed:
+			b.WriteString("[" + strconv.Itoa(s.index) + "]")
+			keys++
+		default:
+			if keys > 0 {
+				b.WriteByte('.')
+			}
+			b.WriteString(spell(s.key))
+			keys++
+		}
+	}
+	switch {
+	case b.Len() == 0:
+		b.WriteString("document: ")
+	case keys > 0:
+		b.WriteString(": ")
+	}
+	b.WriteString(e.err.Error())
+	return b.String()
+}
+
+func locate(err error, s step) error {
+	if err == nil {
+		return nil
+	}
+	pe, ok := err.(*pathError)
+	if !ok {
+		pe = &pathError{err: err}
+	}
+	pe.steps = append(pe.steps, s)
+	return pe
+}
+
+func at(err error, key string) error   { return locate(err, step{key: key}) }
+func atIndex(err error, i int) error   { return locate(err, step{index: i, indexed: true}) }
+func in(err error, macro string) error { return locate(err, step{key: macro, macro: true}) }
+
+// quote spells text a document supplied for an error: quoted, and cut to 32 bytes
+func quote(s string) string {
+	if len(s) > 32 {
+		return fmt.Sprintf("%q... (%d bytes)", s[:32], len(s))
+	}
+	return strconv.Quote(s)
+}
+
+// spell is a key or a name in an error's path: as written when it is a short
+// bare key, else quoted
+func spell(s string) string {
+	for _, c := range s {
+		if c != '_' && c != '-' && (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return quote(s)
+		}
+	}
+	if s == "" || len(s) > 32 {
+		return quote(s)
+	}
+	return s
 }
 
 func validName(s string) bool {
@@ -518,46 +1140,6 @@ func validName(s string) bool {
 	return s != ""
 }
 
-func typeHolds(typ string, v any) bool {
-	k := kindOf(v)
-	return typ == typeAny || typ == k || (typ == typeFloat && k == typeInt)
-}
-
-func kindOf(v any) string {
-	switch v.(type) {
-	case int64:
-		return typeInt
-	case float64:
-		return typeFloat
-	case bool:
-		return typeBool
-	case string:
-		return typeString
-	case map[string]any:
-		return typeTable
-	case []any, []map[string]any:
-		return typeArray
-	default:
-		return fmt.Sprintf("%T", v)
-	}
-}
-
-// elements views either array form the parser produces as []any.
-func elements(v any) ([]any, bool) {
-	switch v := v.(type) {
-	case []any:
-		return v, true
-	case []map[string]any:
-		out := make([]any, len(v))
-		for i, t := range v {
-			out[i] = t
-		}
-		return out, true
-	default:
-		return nil, false
-	}
-}
-
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -565,20 +1147,4 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	slices.Sort(keys)
 	return keys
-}
-
-func join(path, key string) string {
-	if path == "" {
-		return key
-	}
-	return path + "." + key
-}
-
-func index(path string, i int) string { return fmt.Sprintf("%s[%d]", path, i) }
-
-func at(path string) string {
-	if path == "" {
-		return "document"
-	}
-	return path
 }
