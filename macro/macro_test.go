@@ -841,14 +841,19 @@ func TestEachSharesAValueThatIsNotAnArray(t *testing.T) {
 	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], tags = [1], vel = 0.8 } }]\n",
 		`each: argument "tags" has 1 elements, the others 2`)
 
-	// A shared value nested near the bound leaves the arrays beside it as shallow
-	// as they are: pos is placed twelve levels under where tags is
+	// A value nested near the bound and a shallow one leave each other's nesting
+	// alone, whichever of them is shared: pos is placed twelve levels under tags
 	const deep = "[macros.Deep]\nparams = { pos = \"int\", tags = \"any\" }\nbody = { tags = \"${tags}\", at = [[[[[[[[[[[[\"${pos}\"]]]]]]]]]]]] }\n"
-	tags := "{ k = " + strings.Repeat("[", 990) + strings.Repeat("]", 990) + " }"
-	got, spent, err = through(t, deep+"[x]\nevent = [{ macro = \"Deep\", each = { pos = [0, 4], tags = "+tags+" } }]\n")
-	want, wantSpent, wantErr := through(t, deep+"[x]\nevent = [{ macro = \"Deep\", each = { pos = [0, 4] }, tags = "+tags+" }]\n")
-	if err != nil || wantErr != nil || !reflect.DeepEqual(got, want) || spent != wantSpent {
-		t.Fatalf("a deep value shared in each: %.200v, spent %d; beside each: %.200v, spent %d", err, spent, wantErr, wantSpent)
+	nested := strings.Repeat("[", 990) + strings.Repeat("]", 990)
+	for _, c := range [][2]string{
+		{"each = { pos = [0, 4], tags = { k = " + nested + " } }", "each = { pos = [0, 4] }, tags = { k = " + nested + " }"},
+		{"each = { pos = 4, tags = [" + nested + ", " + nested + "] }", "each = { tags = [" + nested + ", " + nested + "] }, pos = 4"},
+	} {
+		got, spent, err := through(t, deep+"[x]\nevent = [{ macro = \"Deep\", "+c[0]+" }]\n")
+		want, wantSpent, wantErr := through(t, deep+"[x]\nevent = [{ macro = \"Deep\", "+c[1]+" }]\n")
+		if err != nil || wantErr != nil || !reflect.DeepEqual(got, want) || spent != wantSpent {
+			t.Fatalf("shared in each: %.200v, spent %d; beside each: %.200v, spent %d", err, spent, wantErr, wantSpent)
+		}
 	}
 }
 
