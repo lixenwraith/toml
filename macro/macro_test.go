@@ -350,7 +350,7 @@ func TestExpansionCostFollowsItsSize(t *testing.T) {
 }
 
 // A result is its reader's own: writing over it reaches neither the document
-// nor the set, whether a body copied, moved or lent what it holds, and the
+// nor the set, whether a body copied what it holds or lent it on, and the
 // result holds no table or array twice.
 func TestAResultSharesNothing(t *testing.T) {
 	const src = `

@@ -102,7 +102,6 @@ type macro struct {
 	names    []string // the parameters' names
 	params   []param
 	required uint64 // slots with no default
-	single   uint64 // slots the body takes whole exactly once: their argument moves
 	body     node
 }
 
@@ -237,7 +236,7 @@ func define(name string, raw any) (*macro, error) {
 	if def["defaults"] != nil && !ok {
 		return nil, errors.New("defaults must be a table")
 	}
-	c := compiler{m: m, uses: make([]int, len(m.params))}
+	c := compiler{m: m}
 	for _, key := range sortedKeys(defaults) {
 		slot, ok := m.slot(key)
 		if !ok {
@@ -262,11 +261,6 @@ func define(name string, raw any) (*macro, error) {
 		return nil, at(err, "body")
 	}
 	m.body = n
-	for slot, uses := range c.uses {
-		if uses == 1 {
-			m.single |= 1 << slot
-		}
-	}
 	return m, nil
 }
 
@@ -275,7 +269,6 @@ func define(name string, raw any) (*macro, error) {
 type compiler struct {
 	m        *macro
 	template bool
-	uses     []int // whole-value references to each parameter
 }
 
 // compile reads v. plain reports a node that is v as written, so that the value
@@ -313,7 +306,6 @@ func (c *compiler) text(s string) (node, bool, error) {
 	case segs[0].slot < 0:
 		return node{op: opValue, value: segs[0].text, size: 1}, false, nil
 	}
-	c.uses[segs[0].slot]++
 	return node{op: opArg, slot: segs[0].slot}, false, nil
 }
 
@@ -497,7 +489,7 @@ func (s *Set) Expand(doc map[string]any) (map[string]any, error) {
 		return nil, errDefinitions
 	}
 	e := expander{set: s, limit: cmp.Or(s.MaxValues, DefaultMaxValues)}
-	out, _, _, err := e.walk(doc, 0, true)
+	out, _, err := e.walk(doc, 0)
 	if err != nil {
 		if _, ok := err.(*pathError); !ok {
 			err = &pathError{err: err}
@@ -532,9 +524,7 @@ type call struct {
 	base  int
 	count int    // times the body is instantiated
 	given uint64 // slots holding an argument; the rest take their default
-	owned uint64 // slots whose argument was made for this call
 	each  uint64 // slots bound per element of a list
-	move  uint64 // slots whose argument goes into the result as it is
 }
 
 func (e *expander) spend(n int) error {
@@ -557,111 +547,53 @@ func (e *expander) sorted(t map[string]any) int {
 	return base
 }
 
-// walk expands the invocations in v, a value of a document, for depth d of the
-// result. Unless fresh, a value holding none comes back as it is, uncopied, and
-// changed reports false.
-func (e *expander) walk(v any, d int, fresh bool) (out any, h int, changed bool, err error) {
+// walk copies v, a value of a document, for depth d of the result, with every
+// invocation in it expanded; h is the copy's nesting
+func (e *expander) walk(v any, d int) (out any, h int, err error) {
 	switch v := v.(type) {
 	case map[string]any:
 		if _, ok := v[keyInvoke]; ok {
-			out, h, err = e.invokeRaw(v, d, false, nil)
-			return out, h, true, err
+			return e.invokeRaw(v, d, false, nil)
 		}
-		return e.walkTable(v, d, fresh)
+		if d >= maxNesting {
+			return nil, 0, errNesting
+		}
+		out := make(map[string]any, len(v))
+		base := e.sorted(v)
+		for i := base; i < base+len(v); i++ {
+			k := e.keys[i]
+			x, xh, err := e.walk(v[k], d+1)
+			if err != nil {
+				return nil, 0, at(err, k)
+			}
+			out[k], h = x, max(h, xh)
+		}
+		e.keys = e.keys[:base]
+		return out, h + 1, nil
 	case []any:
-		return e.walkArray(v, d, fresh)
+		if d >= maxNesting {
+			return nil, 0, errNesting
+		}
+		out := make([]any, 0, len(v))
+		for i, el := range v {
+			if out, h, err = e.element(el, i, d, out, h); err != nil {
+				return nil, 0, err
+			}
+		}
+		return out, h + 1, nil
 	case []map[string]any:
 		if d >= maxNesting {
-			return nil, 0, false, errNesting
+			return nil, 0, errNesting
 		}
-		list := make([]any, 0, len(v))
-		for i, t := range v {
-			if list, h, err = e.element(t, i, d, list, h); err != nil {
-				return nil, 0, false, err
+		out := make([]any, 0, len(v))
+		for i, el := range v {
+			if out, h, err = e.element(el, i, d, out, h); err != nil {
+				return nil, 0, err
 			}
 		}
-		return list, h + 1, true, nil
+		return out, h + 1, nil
 	}
-	return v, 0, fresh, nil
-}
-
-func (e *expander) walkTable(t map[string]any, d int, fresh bool) (any, int, bool, error) {
-	if d >= maxNesting {
-		return nil, 0, false, errNesting
-	}
-	var out map[string]any
-	if fresh {
-		out = make(map[string]any, len(t))
-	}
-	h, base := 0, e.sorted(t)
-	for i := base; i < base+len(t); i++ {
-		k := e.keys[i]
-		x, xh, changed, err := e.walk(t[k], d+1, out != nil)
-		if err != nil {
-			return nil, 0, false, at(err, k)
-		}
-		if changed && out == nil {
-			out = make(map[string]any, len(t))
-			for _, prev := range e.keys[base:i] {
-				out[prev], _ = clone(t[prev])
-			}
-		}
-		if out != nil {
-			out[k] = x
-		}
-		h = max(h, xh)
-	}
-	e.keys = e.keys[:base]
-	if out == nil {
-		return t, h + 1, false, nil
-	}
-	return out, h + 1, true, nil
-}
-
-func (e *expander) walkArray(a []any, d int, fresh bool) (any, int, bool, error) {
-	if d >= maxNesting {
-		return nil, 0, false, errNesting
-	}
-	var out []any
-	if fresh {
-		out = make([]any, 0, len(a))
-	}
-	h := 0
-	for i, el := range a {
-		if out == nil {
-			t, _ := el.(map[string]any)
-			_, invokes := t[keyInvoke]
-			if !invokes {
-				x, xh, changed, err := e.walk(el, d+1, false)
-				if err != nil {
-					return nil, 0, false, atIndex(err, i)
-				}
-				if h = max(h, xh); !changed {
-					continue
-				}
-				out = append(prefix(a, i), x)
-				continue
-			}
-			out = prefix(a, i)
-		}
-		var err error
-		if out, h, err = e.element(el, i, d, out, h); err != nil {
-			return nil, 0, false, err
-		}
-	}
-	if out == nil {
-		return a, h + 1, false, nil
-	}
-	return out, h + 1, true, nil
-}
-
-// prefix copies a[:i] into an array with room for the rest of a
-func prefix(a []any, i int) []any {
-	out := make([]any, i, len(a))
-	for j, el := range a[:i] {
-		out[j], _ = clone(el)
-	}
-	return out
+	return v, 0, nil
 }
 
 // element appends an array's element i to out, expanded: an invocation's
@@ -673,7 +605,7 @@ func (e *expander) element(el any, i, d int, out []any, h int) ([]any, int, erro
 			return out, max(h, xh), atIndex(err, i)
 		}
 	}
-	x, xh, _, err := e.walk(el, d+1, true)
+	x, xh, err := e.walk(el, d+1)
 	return append(out, x), max(h, xh), atIndex(err, i)
 }
 
@@ -729,25 +661,25 @@ func (e *expander) invokeRaw(inv map[string]any, d int, expanded bool, dst *[]an
 		if !ok {
 			return nil, 0, in(fmt.Errorf("unknown argument %s", quote(k)), m.name)
 		}
-		v, h, owned := inv[k], 0, true
+		v, h := inv[k], 0
 		if expanded {
 			_, h = measure(v)
-		} else if v, h, owned, err = e.walk(v, d, false); err != nil {
+		} else if v, h, err = e.walk(v, d); err != nil {
 			return nil, 0, at(err, k)
 		}
-		if err := e.put(&c, slot, v, h, owned); err != nil {
+		if err := e.put(&c, slot, v, h); err != nil {
 			return nil, 0, in(err, m.name)
 		}
 	}
 	e.keys = e.keys[:base]
 	if iterated {
-		h, owned := 0, true
+		h := 0
 		if expanded {
 			_, h = measure(lists)
-		} else if lists, h, owned, err = e.walk(lists, d, false); err != nil {
+		} else if lists, h, err = e.walk(lists, d); err != nil {
 			return nil, 0, at(err, keyEach)
 		}
-		if err := e.lists(&c, lists, h, owned); err != nil {
+		if err := e.lists(&c, lists, h); err != nil {
 			return nil, 0, in(err, m.name)
 		}
 	}
@@ -755,7 +687,7 @@ func (e *expander) invokeRaw(inv map[string]any, d int, expanded bool, dst *[]an
 }
 
 // invokeNode expands an invocation a body holds. An argument that is a
-// reference or static is lent to the macro invoked, not copied for it.
+// reference or static is lent to the macro invoked, which copies what it places.
 func (e *expander) invokeNode(n *node, f *call, d int, dst *[]any) (any, int, error) {
 	if len(n.elems) > 1 && dst == nil {
 		return nil, 0, errEachValue
@@ -775,11 +707,11 @@ func (e *expander) invokeNode(n *node, f *call, d int, dst *[]any) (any, int, er
 		if !ok {
 			return nil, 0, in(fmt.Errorf("unknown argument %s", quote(fld.key)), m.name)
 		}
-		v, h, owned, err := e.pass(&fld.node, f, d)
+		v, h, err := e.pass(&fld.node, f, d)
 		if err != nil {
 			return nil, 0, at(err, fld.key)
 		}
-		if err := e.put(&c, slot, v, h, owned); err != nil {
+		if err := e.put(&c, slot, v, h); err != nil {
 			return nil, 0, in(err, m.name)
 		}
 	}
@@ -789,11 +721,11 @@ func (e *expander) invokeNode(n *node, f *call, d int, dst *[]any) (any, int, er
 	if each := &n.elems[1]; each.op == opTable && !each.dynamic && len(each.fields) > 0 {
 		for i := range each.fields {
 			fld := &each.fields[i]
-			v, h, owned, err := e.pass(&fld.node, f, d)
+			v, h, err := e.pass(&fld.node, f, d)
 			if err != nil {
 				return nil, 0, at(at(err, fld.key), keyEach)
 			}
-			if err := e.list(&c, fld.key, v, h, owned); err != nil {
+			if err := e.list(&c, fld.key, v, h); err != nil {
 				return nil, 0, in(err, m.name)
 			}
 		}
@@ -803,45 +735,42 @@ func (e *expander) invokeNode(n *node, f *call, d int, dst *[]any) (any, int, er
 	if err != nil {
 		return nil, 0, at(err, keyEach)
 	}
-	if err := e.lists(&c, lists, h, true); err != nil {
+	if err := e.lists(&c, lists, h); err != nil {
 		return nil, 0, in(err, m.name)
 	}
 	return e.run(&c, d, dst)
 }
 
 // pass is an argument for an invocation in a body: a reference or a static
-// value as it stands, lent unless it was the caller's to move, else a new value
-func (e *expander) pass(n *node, f *call, d int) (v any, h int, owned bool, err error) {
+// value as it stands, lent, else a value made for it
+func (e *expander) pass(n *node, f *call, d int) (any, int, error) {
 	switch n.op {
 	case opArg:
 		return e.use(f, n.slot, d, false)
 	case opValue, opStatic:
-		return n.value, n.height, false, nil
+		return n.value, n.height, nil
 	}
-	v, h, err = e.inst(n, f, d)
-	return v, h, true, err
+	return e.inst(n, f, d)
 }
 
-func (e *expander) put(c *call, slot int, v any, h int, owned bool) error {
+func (e *expander) put(c *call, slot int, v any, h int) error {
 	if k := c.m.params[slot].kind; !k.holds(v) {
 		return fmt.Errorf("argument %s: want %s, got %s", quote(c.m.names[slot]), kindNames[k], kindName(v))
 	}
 	e.args[c.base+slot] = arg{v, h}
-	if c.given |= 1 << slot; owned {
-		c.owned |= 1 << slot
-	}
+	c.given |= 1 << slot
 	return nil
 }
 
 // lists reads an each table, whose nesting is h: parameter = array, all one length
-func (e *expander) lists(c *call, v any, h int, owned bool) error {
+func (e *expander) lists(c *call, v any, h int) error {
 	table, ok := v.(map[string]any)
 	if !ok || len(table) == 0 {
 		return errEach
 	}
 	base := e.sorted(table)
 	for i := base; i < base+len(table); i++ {
-		if err := e.list(c, e.keys[i], table[e.keys[i]], h-1, owned); err != nil {
+		if err := e.list(c, e.keys[i], table[e.keys[i]], h-1); err != nil {
 			return err
 		}
 	}
@@ -851,7 +780,7 @@ func (e *expander) lists(c *call, v any, h int, owned bool) error {
 
 // list binds one parameter of an each to its array. Keys arrive sorted, as
 // slots are, so the lists stand after the arguments in slot order.
-func (e *expander) list(c *call, key string, v any, h int, owned bool) error {
+func (e *expander) list(c *call, key string, v any, h int) error {
 	slot, declared := c.m.slot(key)
 	if !declared {
 		return fmt.Errorf("each: unknown argument %s", quote(key))
@@ -871,9 +800,7 @@ func (e *expander) list(c *call, key string, v any, h int, owned bool) error {
 		}
 	}
 	e.args = append(e.args, arg{list, h})
-	if c.each, c.count = c.each|1<<slot, len(list); owned {
-		c.owned |= 1 << slot
-	}
+	c.each, c.count = c.each|1<<slot, len(list)
 	return nil
 }
 
@@ -884,10 +811,6 @@ func (e *expander) run(c *call, d int, dst *[]any) (v any, h int, err error) {
 	if missing := m.required &^ (c.given | c.each); missing != 0 {
 		name := m.names[bits.TrailingZeros64(missing)]
 		return nil, 0, in(fmt.Errorf("missing argument %s", quote(name)), m.name)
-	}
-	// An argument is moved only where the body runs once with it
-	if c.move = c.owned & m.single; c.each != 0 {
-		c.move &= c.each
 	}
 	c.given |= c.each
 	e.stack = append(e.stack, m.name)
@@ -918,31 +841,29 @@ func (e *expander) run(c *call, d int, dst *[]any) (v any, h int, err error) {
 	return v, h, nil
 }
 
-// use reads a parameter. For a place in the result at depth d it gives the
-// argument itself when it is a scalar or the call's to move, else a copy; for
-// another invocation it lends the argument as it stands.
-func (e *expander) use(c *call, slot, d int, place bool) (v any, h int, owned bool, err error) {
+// use reads a parameter: its argument, else its default. For a place in the
+// result at depth d a table or array is copied, so no two places share one; for
+// another invocation it is lent as it stands.
+func (e *expander) use(c *call, slot, d int, place bool) (v any, h int, err error) {
 	if c.given&(1<<slot) != 0 {
 		a := e.args[c.base+slot]
-		v, h, owned = a.v, a.h, c.move&(1<<slot) != 0
+		v, h = a.v, a.h
 	} else if def := &c.m.params[slot].def; def.op == opValue || def.op == opStatic {
 		v, h = def.value, def.height
-	} else if v, h, err = e.inst(def, nil, d); err != nil || place {
-		return v, h, true, err
 	} else {
-		owned = true
+		return e.inst(def, nil, d) // a default that invokes, expanded for this use
 	}
 	if !place {
-		return v, h, owned, nil
+		return v, h, nil
 	}
 	if d+h > maxNesting {
-		return nil, 0, false, errNesting
+		return nil, 0, errNesting
 	}
 	n := 1
-	if h > 0 && !owned {
+	if h > 0 {
 		v, n = clone(v)
 	}
-	return v, h, true, e.spend(n)
+	return v, h, e.spend(n)
 }
 
 // inst instantiates a body's node for one call, at depth d of the result
@@ -960,8 +881,7 @@ func (e *expander) inst(n *node, c *call, d int) (any, int, error) {
 		v, _ := clone(n.value)
 		return v, n.height, nil
 	case opArg:
-		v, h, _, err := e.use(c, n.slot, d, true)
-		return v, h, err
+		return e.use(c, n.slot, d, true)
 	case opText:
 		s, err := e.text(n.segs, c)
 		if err != nil {
