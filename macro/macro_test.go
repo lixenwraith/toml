@@ -438,6 +438,351 @@ func scribble(v any) {
 	}
 }
 
+// refuse fails unless src is refused with an error holding want; with no
+// invocation in src, the refusal is one made when a definition is read
+func refuse(t *testing.T, src, want string) {
+	t.Helper()
+	if _, err := ExpandDocument(parse(t, src)); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("got %v, want an error containing %q", err, want)
+	}
+}
+
+// through expands src through a set of its own, and gives what that spent
+func through(t *testing.T, src string) (map[string]any, int, error) {
+	t.Helper()
+	var s Set
+	doc := parse(t, src)
+	if err := s.Define(doc); err != nil {
+		return nil, 0, err
+	}
+	out, err := s.Expand(doc)
+	return out, s.spent, err
+}
+
+// await is the base the tests below write macros over: a parameter of each
+// kind a macro over it fixes, renames or leaves open
+const await = `
+[macros.Emit]
+params = { event = "string", to = "string" }
+body = { action = "EmitEvent", event = "${event}", to = "${to}_anchor" }
+
+[macros.Await]
+params = { request = "table", capture = "string", next = "string", fallback = "string", actions = "array", timeout_ms = "int" }
+defaults = { actions = [], timeout_ms = 500 }
+body = { on_enter = ["${request}"], capture = "${capture}", transitions = [
+    { target = "${next}" },
+    { target = "${fallback}", actions = "${actions}", ms = "${timeout_ms}" },
+] }
+`
+
+func TestADefinitionHasBodyOrBaseNeverBoth(t *testing.T) {
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nbody = 1\n", `macro "M": body and base are both given`)
+	refuse(t, await+"[macros.M]\nbody = 1\nwith = { capture = \"c\" }\n", `macro "M": with stands only beside base`)
+	refuse(t, await+"[macros.M]\nwith = { capture = \"c\" }\n", `macro "M": with stands only beside base`)
+	refuse(t, await+"[macros.M]\ndoc = \"neither\"\n", `macro "M": body is missing`)
+}
+
+// A base is checked with no invocation in the document, and is the name as
+// written where a body would write a$$b
+func TestABaseIsALiteralNameCheckedWhenRead(t *testing.T) {
+	refuse(t, await+"[macros.M]\nbase = \"Awaits\"\n", `macro "M": unknown base "Awaits"`)
+	refuse(t, await+"[macros.M]\nbase = [\"Await\"]\n", `macro "M": base must be a macro's name`)
+	refuse(t, "[macros.M]\nbase = \"${x}\"\nparams = { x = \"string\" }\n", `macro "M": unknown base "${x}"`)
+	got := expand(t, `
+[macros."a$b"]
+params = { n = "int" }
+body = { n = "${n}" }
+
+[macros.M]
+base = "a$b"
+
+[states]
+A = { macro = "M", n = 1 }
+`)
+	equal(t, got, "[states]\nA = { n = 1 }\n")
+}
+
+func TestWithHoldsOnlyArgumentsOfTheBase(t *testing.T) {
+	for key, value := range map[string]string{"zz": "1", "macro": `"Emit"`, "each": "{ capture = [] }"} {
+		refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = { "+key+" = "+value+" }\n",
+			`macro "M": with: macro "Await": unknown argument "`+key+`"`)
+	}
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = [\"c\"]\n", `macro "M": with must be a table of arguments`)
+}
+
+// What with does not set stays open, with the base's type and default; the
+// macro's own are new names, or stand under names with sets
+func TestAMacroOverABaseTakesItsOpenParametersAndItsOwn(t *testing.T) {
+	const pylon = await + `
+[macros.Pylon]
+base = "Await"
+params = { x = "int", attach = "string", next = "int" }
+[macros.Pylon.with]
+request = { spawn = "pylon", x = "${x}" }
+capture = "gw"
+next = "${attach}"
+fallback = "Wave${next}"
+`
+	got := expand(t, pylon+`
+[states]
+A = { macro = "Pylon", x = 20, attach = "GwTL", next = 2 }
+B = { macro = "Pylon", x = 30, attach = "GwTR", next = 3, timeout_ms = 50, actions = [{ macro = "Emit", event = "Skip", to = "t1" }] }
+`)
+	equal(t, got, `
+[states.A]
+on_enter = [{ spawn = "pylon", x = 20 }]
+capture = "gw"
+transitions = [{ target = "GwTL" }, { target = "Wave2", actions = [], ms = 500 }]
+
+[states.B]
+on_enter = [{ spawn = "pylon", x = 30 }]
+capture = "gw"
+transitions = [{ target = "GwTR" }, { target = "Wave3", actions = [{ action = "EmitEvent", event = "Skip", to = "t1_anchor" }], ms = 50 }]
+`)
+	refuse(t, pylon+"[states]\nA = { macro = \"Pylon\", x = 1, attach = \"G\", next = 2, timeout_ms = \"soon\" }\n",
+		`states.A: macro "Pylon": argument "timeout_ms": want int, got string`)
+	refuse(t, pylon+"[states]\nA = { macro = \"Pylon\", x = 1, attach = \"G\", next = 2, capture = \"c\" }\n",
+		`states.A: macro "Pylon": unknown argument "capture"`)
+	refuse(t, pylon+"[states]\nA = { macro = \"Pylon\", attach = \"G\", next = 2 }\n", `states.A: macro "Pylon": missing argument "x"`)
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nparams = { timeout_ms = \"int\" }\n",
+		`macro "M": parameter "timeout_ms": the base leaves it open`)
+}
+
+func TestDefaultsGiveOrReplaceADefaultOfAMacroOverABase(t *testing.T) {
+	const kick = await + `
+[macros.Kick]
+base = "Await"
+params = { beat = "int" }
+defaults = { next = "Idle", timeout_ms = 100, beat = 4 }
+with = { request = { beat = "${beat}" }, capture = "c" }
+`
+	got := expand(t, kick+"[states]\nA = { macro = \"Kick\", fallback = \"F\" }\n")
+	equal(t, got, `
+[states.A]
+on_enter = [{ beat = 4 }]
+capture = "c"
+transitions = [{ target = "Idle" }, { target = "F", actions = [], ms = 100 }]
+`)
+	for _, c := range []struct{ defaults, want string }{
+		{`{ timeout_ms = "soon" }`, `default for "timeout_ms": want int, got string`},
+		{`{ beat = "four" }`, `default for "beat": want int, got string`},
+		{`{ capture = "c" }`, `default for undeclared parameter "capture"`},
+	} {
+		refuse(t, await+"[macros.M]\nbase = \"Await\"\nparams = { beat = \"int\" }\nwith = { capture = \"c\" }\ndefaults = "+c.defaults+"\n", c.want)
+	}
+}
+
+// with names the macro's parameters, its own and the open ones. Written without
+// $ a value is checked when read; holding a reference, when it has its argument.
+func TestWithIsATemplateCheckedWhenReadOrAtExpansion(t *testing.T) {
+	const flank = await + `
+[macros.Flank]
+base = "Await"
+params = { side = "string", ms = "any" }
+with = { capture = "${side}_p2n", fallback = "${next}", timeout_ms = "${ms}", actions = [{ macro = "Emit", event = "Lost", to = "${side}" }] }
+`
+	got := expand(t, flank+"[states]\nA = { macro = \"Flank\", request = {}, side = \"l\", next = \"N\", ms = 7 }\n")
+	equal(t, got, `
+[states.A]
+on_enter = [{}]
+capture = "l_p2n"
+transitions = [{ target = "N" }, { target = "N", actions = [{ action = "EmitEvent", event = "Lost", to = "l_anchor" }], ms = 7 }]
+`)
+	refuse(t, flank+"[states]\nA = { macro = \"Flank\", request = {}, side = \"l\", next = \"N\", ms = \"soon\" }\n",
+		`states.A: macro "Flank": with: macro "Await": argument "timeout_ms": want int, got string`)
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = { timeout_ms = \"soon\" }\n",
+		`macro "M": with: macro "Await": argument "timeout_ms": want int, got string`)
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = { capture = \"${side}\" }\n", `macro "M": with.capture: undeclared parameter "side"`)
+
+	// What a value that invokes is, is known once it expands
+	const invokes = await + "[macros.M]\nbase = \"Await\"\nwith = { actions = { macro = \"Emit\", event = \"Lost\", to = \"t1\" } }\n"
+	expand(t, invokes)
+	refuse(t, invokes+"[states]\nA = { macro = \"M\", request = {}, capture = \"c\", next = \"N\", fallback = \"F\" }\n",
+		`states.A: macro "M": with: macro "Await": argument "actions": want array, got table`)
+}
+
+// The shapes the macros written as one invocation of another take, over their
+// base and as the body they stand for: the same tree at the same cost, and the
+// same refusal but for the name of the part
+func TestAMacroOverABaseExpandsAsItsBodyWould(t *testing.T) {
+	const over = `
+[macros.Rank]
+base = "Await"
+with = { capture = "rank", timeout_ms = 900, actions = [{ macro = "Emit", event = "Late", to = "t1" }] }
+
+[macros.Kick]
+base = "Await"
+defaults = { next = "Idle", timeout_ms = 100 }
+
+[macros.Arp]
+base = "Await"
+params = { actions = "string" }
+with = { actions = [{ macro = "Emit", event = "${actions}", to = "t1" }, { macro = "Emit", event = "Done", to = "t2" }] }
+
+[macros.Pylon]
+base = "Await"
+params = { attach = "string", next = "string" }
+with = { next = "${attach}", fallback = "${next}", capture = "gw" }
+
+[macros.Flank]
+base = "Pylon"
+params = { side = "string", ms = "any" }
+with = { attach = "${side}_p2n", timeout_ms = "${ms}", actions = [{ macro = "Emit", event = "Lost", to = "${side}" }] }
+`
+	const body = `
+[macros.Rank]
+params = { request = "table", next = "string", fallback = "string" }
+body = { macro = "Await", request = "${request}", next = "${next}", fallback = "${fallback}", capture = "rank", timeout_ms = 900, actions = [{ macro = "Emit", event = "Late", to = "t1" }] }
+
+[macros.Kick]
+params = { request = "table", capture = "string", next = "string", fallback = "string", actions = "array", timeout_ms = "int" }
+defaults = { actions = [], next = "Idle", timeout_ms = 100 }
+body = { macro = "Await", request = "${request}", capture = "${capture}", next = "${next}", fallback = "${fallback}", actions = "${actions}", timeout_ms = "${timeout_ms}" }
+
+[macros.Arp]
+params = { request = "table", capture = "string", next = "string", fallback = "string", actions = "string", timeout_ms = "int" }
+defaults = { timeout_ms = 500 }
+body = { macro = "Await", request = "${request}", capture = "${capture}", next = "${next}", fallback = "${fallback}", timeout_ms = "${timeout_ms}", actions = [{ macro = "Emit", event = "${actions}", to = "t1" }, { macro = "Emit", event = "Done", to = "t2" }] }
+
+[macros.Pylon]
+params = { request = "table", attach = "string", next = "string", actions = "array", timeout_ms = "int" }
+defaults = { actions = [], timeout_ms = 500 }
+body = { macro = "Await", request = "${request}", next = "${attach}", fallback = "${next}", capture = "gw", actions = "${actions}", timeout_ms = "${timeout_ms}" }
+
+[macros.Flank]
+params = { request = "table", next = "string", side = "string", ms = "any" }
+body = { macro = "Pylon", request = "${request}", next = "${next}", attach = "${side}_p2n", timeout_ms = "${ms}", actions = [{ macro = "Emit", event = "Lost", to = "${side}" }] }
+`
+	const states = `
+[states]
+A = { macro = "Rank", request = { r = [1] }, next = "B", fallback = "F" }
+B = { macro = "Kick", request = {}, capture = "c", fallback = "F" }
+C = { macro = "Arp", request = {}, capture = "c", next = "B", fallback = "F", actions = "Go" }
+D = { macro = "Pylon", request = {}, attach = "At", next = "Nx", timeout_ms = 50 }
+E = { macro = "Flank", request = {}, side = "l", next = "Nx", ms = 7 }
+list = [{ macro = "Kick", each = { capture = ["a", "b"], request = [{}, { r = 2 }] }, fallback = "F" }]
+`
+	want, wantSpent, err := through(t, await+body+states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, spent, err := through(t, await+over+states)
+	if err != nil || !reflect.DeepEqual(got, want) || spent != wantSpent {
+		t.Fatalf("over a base: %v, spent %d\n got %v\nwant %v, spent %d", err, spent, got, want, wantSpent)
+	}
+	const late = "F = { macro = \"Flank\", request = {}, side = \"l\", next = \"Nx\", ms = \"soon\" }\n"
+	_, _, wantErr := through(t, await+body+states+late)
+	_, _, err = through(t, await+over+states+late)
+	if err == nil || wantErr == nil || strings.ReplaceAll(err.Error(), ": with: ", ": body: ") != wantErr.Error() {
+		t.Fatalf("over a base refused as %v, the body as %v", err, wantErr)
+	}
+}
+
+// A document's macros are read in the order of their names, which is not the
+// order of their bases. Across a set a base is one already defined: the last
+// document defined is the one that invokes.
+func TestABaseResolvesWhateverTheOrderOfNames(t *testing.T) {
+	got := expand(t, `
+[macros.A]
+base = "B"
+with = { b = 2 }
+[macros.B]
+base = "D"
+with = { c = 3 }
+[macros.C]
+base = "A"
+with = { a = 1 }
+[macros.D]
+params = { a = "int", b = "int", c = "int" }
+body = [["${a}", "${b}", "${c}"]]
+[states]
+list = [{ macro = "C" }, { macro = "A", a = 4 }, { macro = "B", a = 5, b = 6 }]
+`)
+	equal(t, got, "[states]\nlist = [[1, 2, 3], [4, 2, 3], [5, 6, 3]]\n")
+
+	const library, entry = "[macros.Raider]\nparams = { hp = \"int\" }\nbody = { hp = \"${hp}\" }\n",
+		"[macros.Rank1]\nbase = \"Raider\"\nwith = { hp = 8 }\n"
+	s := NewSet()
+	if err := s.Define(parse(t, library)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Define(parse(t, entry)); err != nil {
+		t.Fatalf("a base of an earlier document: %v", err)
+	}
+	if out, err := s.Expand(parse(t, "a = { macro = \"Rank1\" }\n")); err != nil || !reflect.DeepEqual(out["a"], map[string]any{"hp": int64(8)}) {
+		t.Fatalf("got %v, %v", out, err)
+	}
+	s = NewSet()
+	if err := s.Define(parse(t, entry)); err == nil || !strings.Contains(err.Error(), `macro "Rank1": unknown base "Raider"`) {
+		t.Fatalf("a base of a later document: %v", err)
+	}
+}
+
+func TestAMacroIsNotItsOwnBase(t *testing.T) {
+	var b strings.Builder
+	for i := range 5000 {
+		fmt.Fprintf(&b, "[macros.M%d]\nbase = \"M%d\"\n", i, (i+1)%5000)
+	}
+	for _, c := range []struct{ name, src, want string }{
+		{"itself", "[macros.A]\nbase = \"A\"\n", `macro "A" is its own base through "A"`},
+		{"through another", "[macros.A]\nbase = \"B\"\n[macros.B]\nbase = \"A\"\n", `macro "A" is its own base through "B"`},
+		{"under a macro over it", "[macros.A]\nbase = \"C\"\n[macros.B]\nbase = \"C\"\n[macros.C]\nbase = \"B\"\n", `macro "C" is its own base through "B"`},
+		{"through 5000", b.String(), `macro "M0" is its own base through "M4999"`},
+	} {
+		if _, err := ExpandDocument(parse(t, c.src)); err == nil || !strings.Contains(err.Error(), c.want) || len(err.Error()) > 1024 {
+			t.Errorf("%s: %.300v", c.name, err)
+		}
+	}
+}
+
+func TestTheParameterBoundCountsAllOfAMacroOverABase(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[macros.B]\nbody = 1\n[macros.B.params]\n")
+	for i := range maxParams {
+		b.WriteString("p" + strconv.Itoa(i) + " = \"int\"\n")
+	}
+	base := b.String()
+	if _, err := ExpandDocument(parse(t, base+"[macros.M]\nbase = \"B\"\nparams = { p0 = \"string\" }\nwith = { p0 = 1 }\n")); err != nil {
+		t.Fatalf("64 parameters, one its own under a name with sets: %v", err)
+	}
+	refuse(t, base+"[macros.M]\nbase = \"B\"\nparams = { own = \"int\" }\n", `macro "M": more than 64 parameters`)
+}
+
+// A base is an invocation deeper, as the body it stands for is; a chain no
+// invocation can reach the end of is still read, and read without recursion
+func TestAChainOfBasesCountsTowardTheNestingBound(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[macros.N0]\nbody = 1\n")
+	for i := 1; i <= 5000; i++ {
+		fmt.Fprintf(&b, "[macros.N%d]\nbase = \"N%d\"\n", i, i-1)
+	}
+	chain := b.String()
+	got := expand(t, chain+"[x]\na = { macro = \"N"+strconv.Itoa(maxDepth-1)+"\" }\n")
+	equal(t, got, "[x]\na = 1\n")
+	refuse(t, chain+"[x]\na = { macro = \"N"+strconv.Itoa(maxDepth)+"\" }\n", `with: macros nest deeper than 32`)
+}
+
+// A path through with reads as one through a body does, a key no bare key
+// spells quoted and a long one cut
+func TestErrorsNameThePathThroughWith(t *testing.T) {
+	long := strings.Repeat("k", 1<<16)
+	for _, c := range []struct{ name, with, want string }{
+		{"into a value", `actions = [0, { macro = "Emit", event = "${capture}" }]`,
+			`states.A: macro "M": with.actions[1]: macro "Emit": missing argument "to"`},
+		{"a key no bare key spells", `actions = [{ "a.b\n" = { macro = "Nope" } }]`, `states.A: macro "M": with.actions[0]."a.b\n": unknown macro "Nope"`},
+		{"a long key", `actions = [{ "` + long + `" = { macro = "Nope" } }]`, `(65536 bytes): unknown macro "Nope"`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := await + "[macros.M]\nbase = \"Await\"\nwith = { " + c.with + " }\n" +
+				"[states]\nA = { macro = \"M\", request = {}, capture = \"c\", next = \"N\", fallback = \"F\" }\n"
+			_, err := ExpandDocument(parse(t, src))
+			if err == nil || !strings.Contains(err.Error(), c.want) || len(err.Error()) > 1024 {
+				t.Fatalf("got %.300v (%d bytes), want an error containing %q", err, len(fmt.Sprint(err)), c.want)
+			}
+		})
+	}
+}
+
 // Scenarios arrive from peers: any parsed document either expands or is refused,
 // the same way each time, into a result that holds no invocation and shares
 // nothing with the document.
@@ -446,6 +791,7 @@ func FuzzExpandDocument(f *testing.F) {
 	f.Add("[macros.M]\nbody = { \"${y}\" = 1 }\n")
 	f.Add("a = { macro = \"M\" }\n")
 	f.Add("[macros.M]\nparams = { t = \"table\", l = \"array\" }\ndefaults = { l = [{ macro = \"N\" }] }\nbody = { a = \"${t}\", b = \"${t}\", \"k${l}\" = [\"${l}\"] }\n[macros.N]\nbody = [[1]]\n[[x]]\nmacro = \"M\"\nt = { u = [{}] }\n")
+	f.Add("[macros.A]\nbase = \"B\"\nparams = { b = \"int\" }\ndefaults = { a = 1 }\nwith = { b = [\"${b}\", { macro = \"C\" }] }\n[macros.B]\nparams = { a = \"int\", b = \"any\", c = \"table\" }\ndefaults = { c = { macro = \"C\" } }\nbody = { a = \"${a}\", b = \"${b}\", c = [\"${c}\"] }\n[macros.C]\nbase = \"B\"\nwith = { a = 2, b = {}, c = {} }\n[[x]]\nmacro = \"A\"\nb = 3\n")
 	f.Fuzz(func(t *testing.T, src string) {
 		doc, err := toml.NewParser([]byte(src)).Parse()
 		if err != nil {
