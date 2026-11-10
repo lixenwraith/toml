@@ -773,12 +773,12 @@ func TestTheParametersBasesLeaveOpenAreBounded(t *testing.T) {
 	if err := s.Define(parse(t, b.String())); err != nil {
 		t.Fatalf("%d open parameters: %v", maxOpen, err)
 	}
-	if err := s.Define(parse(t, fixed.String())); err != nil {
-		t.Fatalf("a macro that leaves none open: %v", err)
-	}
 	err := s.Define(parse(t, "[macros.Over]\nbase = \"B\"\nwith = { p0 = 1 }\n"))
 	if err == nil || !strings.Contains(err.Error(), `macro "Over": bases leave more than 65536 parameters open`) {
 		t.Fatalf("63 more through the same set: %v", err)
+	}
+	if err := s.Define(parse(t, fixed.String())); err != nil {
+		t.Fatalf("a macro that leaves none open, after one refused: %v", err)
 	}
 }
 
@@ -840,6 +840,16 @@ func TestEachSharesAValueThatIsNotAnArray(t *testing.T) {
 	}
 	refuse(t, hit+"[x]\nevent = [{ macro = \"Hit\", each = { pos = [0, 4], tags = [1], vel = 0.8 } }]\n",
 		`each: argument "tags" has 1 elements, the others 2`)
+
+	// A shared value nested near the bound leaves the arrays beside it as shallow
+	// as they are: pos is placed twelve levels under where tags is
+	const deep = "[macros.Deep]\nparams = { pos = \"int\", tags = \"any\" }\nbody = { tags = \"${tags}\", at = [[[[[[[[[[[[\"${pos}\"]]]]]]]]]]]] }\n"
+	tags := "{ k = " + strings.Repeat("[", 990) + strings.Repeat("]", 990) + " }"
+	got, spent, err = through(t, deep+"[x]\nevent = [{ macro = \"Deep\", each = { pos = [0, 4], tags = "+tags+" } }]\n")
+	want, wantSpent, wantErr := through(t, deep+"[x]\nevent = [{ macro = \"Deep\", each = { pos = [0, 4] }, tags = "+tags+" }]\n")
+	if err != nil || wantErr != nil || !reflect.DeepEqual(got, want) || spent != wantSpent {
+		t.Fatalf("a deep value shared in each: %.200v, spent %d; beside each: %.200v, spent %d", err, spent, wantErr, wantSpent)
+	}
 }
 
 // An array's elements are each an argument; a shared value is one whole,
