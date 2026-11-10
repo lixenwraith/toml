@@ -224,9 +224,11 @@ func (s *Set) Define(doc map[string]any) error {
 				return fmt.Errorf("macro %s: %w", quote(m.name), err)
 			}
 			with, _ := def["with"].(map[string]any)
-			if s.open += len(base.names) - len(with); s.open > maxOpen {
+			open := len(base.names) - len(with)
+			if open > maxOpen-s.open {
 				return fmt.Errorf("macro %s: bases leave more than %d parameters open", quote(m.name), maxOpen)
 			}
+			s.open += open
 			s.macros[m.name] = m
 		}
 	}
@@ -894,8 +896,25 @@ func (e *expander) lists(c *call, v any, h int) error {
 		return errEach
 	}
 	base := e.sorted(table)
+	// The arrays are bound with one nesting, the table's less its own level. A
+	// shared value is no part of that beside each, so with one in the table the
+	// arrays are measured.
+	zh := h - 1
 	for i := base; i < base+len(table); i++ {
-		x, xh := table[e.keys[i]], h-1
+		if _, zipped := table[e.keys[i]].([]any); zipped {
+			continue
+		}
+		zh = 0
+		for j := base; j < base+len(table); j++ {
+			if list, zipped := table[e.keys[j]].([]any); zipped {
+				_, lh := measure(list)
+				zh = max(zh, lh)
+			}
+		}
+		break
+	}
+	for i := base; i < base+len(table); i++ {
+		x, xh := table[e.keys[i]], zh
 		if _, zipped := x.([]any); !zipped {
 			_, xh = measure(x) // its own nesting, as an argument beside each has
 		}
