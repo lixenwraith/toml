@@ -145,7 +145,7 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 		isLast := i == len(keys)-1
 		currentMap, ok := ptr.(map[string]any)
 		if !ok {
-			return fmt.Errorf("key path conflict: %q is not a map", key)
+			return fmt.Errorf("key path conflict: %s is not a map", brief(key))
 		}
 
 		if isLast {
@@ -156,7 +156,7 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 					if s, ok := val.([]map[string]any); ok {
 						slice = s
 					} else {
-						return fmt.Errorf("key conflict: %q is not an array of tables", key)
+						return fmt.Errorf("key conflict: %s is not an array of tables", brief(key))
 					}
 				} else {
 					slice = make([]map[string]any, 0)
@@ -176,11 +176,11 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 					if m, ok := val.(map[string]any); ok {
 						// Inline tables cannot be reopened
 						if p.isFrozen(m) {
-							return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
+							return fmt.Errorf("cannot extend inline table %s at line %d", brief(key), p.curToken.Line)
 						}
 						targetMap = m
 					} else {
-						return fmt.Errorf("key conflict: %q is not a table", key)
+						return fmt.Errorf("key conflict: %s is not a table", brief(key))
 					}
 				} else {
 					var err error
@@ -198,16 +198,16 @@ func (p *Parser) setTableScope(keys []string, isArrayOfTables bool) error {
 				if m, ok := val.(map[string]any); ok {
 					// Inline tables cannot be extended via sub-tables
 					if p.isFrozen(m) {
-						return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
+						return fmt.Errorf("cannot extend inline table %s at line %d", brief(key), p.curToken.Line)
 					}
 					ptr = m
 				} else if slice, ok := val.([]map[string]any); ok {
 					if len(slice) == 0 {
-						return fmt.Errorf("cannot traverse empty array table %q", key)
+						return fmt.Errorf("cannot traverse empty array table %s", brief(key))
 					}
 					ptr = slice[len(slice)-1]
 				} else {
-					return fmt.Errorf("intermediate key %q is not a map", key)
+					return fmt.Errorf("intermediate key %s is not a map", brief(key))
 				}
 			} else {
 				newMap, err := p.newTable()
@@ -249,7 +249,7 @@ func (p *Parser) assignValue(scope map[string]any, keys []string, val any) error
 		if i == len(keys)-1 {
 			// Final key, assign value
 			if _, exists := currentMap[key]; exists {
-				return fmt.Errorf("duplicate key %q at line %d", key, p.curToken.Line)
+				return fmt.Errorf("duplicate key %s at line %d", brief(key), p.curToken.Line)
 			}
 			currentMap[key] = val
 			if m, ok := val.(map[string]any); ok {
@@ -260,11 +260,11 @@ func (p *Parser) assignValue(scope map[string]any, keys []string, val any) error
 			if existing, exists := currentMap[key]; exists {
 				if m, ok := existing.(map[string]any); ok {
 					if p.isFrozen(m) {
-						return fmt.Errorf("cannot extend inline table %q at line %d", key, p.curToken.Line)
+						return fmt.Errorf("cannot extend inline table %s at line %d", brief(key), p.curToken.Line)
 					}
 					currentMap = m
 				} else {
-					return fmt.Errorf("intermediate key %q is not a map", key)
+					return fmt.Errorf("intermediate key %s is not a map", brief(key))
 				}
 			} else {
 				newMap, err := p.newTable()

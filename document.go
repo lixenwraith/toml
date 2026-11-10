@@ -278,7 +278,7 @@ func (u UnknownKeys) Error() string {
 // array of tables is named without its index.
 func Unmapped(data any, v any) []Key {
 	seen := make(map[string]Key)
-	unmapped(data, reflect.TypeOf(v), nil, seen, 0)
+	unmapped(data, reflect.TypeOf(v), make(Key, 0, 16), seen, 0)
 	out := make([]Key, 0, len(seen))
 	for _, k := range seen {
 		out = append(out, k)
@@ -287,6 +287,8 @@ func Unmapped(data any, v any) []Key {
 	return out
 }
 
+// unmapped walks data beside t. at is the path so far, one array the whole
+// walk appends to, so a key is copied only when it is named.
 func unmapped(data any, t reflect.Type, at Key, seen map[string]Key, depth int) {
 	for t != nil && t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -300,22 +302,23 @@ func unmapped(data any, t reflect.Type, at Key, seen map[string]Key, depth int) 
 		if !ok {
 			return
 		}
-		fields := make(map[string]reflect.Type)
-		for _, f := range fieldsOf(t) {
-			fields[f.key] = t.Field(f.index).Type
-		}
+		fields := fieldsOf(t)
 		for k, v := range m {
-			key := append(slices.Clip(at), k)
-			if ft, ok := fields[k]; ok {
-				unmapped(v, ft, key, seen, depth+1)
+			key := append(at, k)
+			i := len(fields) - 1
+			for i >= 0 && fields[i].key != k {
+				i--
+			}
+			if i >= 0 {
+				unmapped(v, fields[i].typ, key, seen, depth+1)
 			} else {
-				seen[key.String()] = key
+				seen[key.String()] = slices.Clone(key)
 			}
 		}
 	case reflect.Map:
 		if m, ok := data.(map[string]any); ok {
 			for k, v := range m {
-				unmapped(v, t.Elem(), append(slices.Clip(at), k), seen, depth+1)
+				unmapped(v, t.Elem(), append(at, k), seen, depth+1)
 			}
 		}
 	case reflect.Slice, reflect.Array:
@@ -522,8 +525,9 @@ func (d *Document) Fill(src *Document) ([]Key, error) {
 		}
 	}
 	var (
-		added, arrays []Key
-		ins           []*insertion
+		added  []Key
+		arrays tables // the arrays of tables src's headers name
+		ins    []*insertion
 	)
 	past := make(map[int]*insertion)      // what goes past a statement of d, by its end
 	placed := make(map[string]*insertion) // where each key Fill adds goes, by the key
@@ -541,9 +545,9 @@ func (d *Document) Fill(src *Document) ([]Key, error) {
 	for _, s := range src.stmts {
 		p := s.path()
 		if s.header && s.array {
-			arrays = append(arrays, p)
+			arrays.at(p).headed = true
 		}
-		if slices.ContainsFunc(arrays, func(a Key) bool { return p.under(a) }) {
+		if arrays.headedOver(p) {
 			continue
 		}
 		name, table := p.String(), p[:len(p)-1]

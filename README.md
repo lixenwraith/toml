@@ -74,8 +74,8 @@ overflowing the stack. Parsing bounds individual value nesting and dotted paths;
 combining paths can still produce trees that exceed the encoder's bound. A
 document may create at most `DefaultMaxTables` (65536) tables, counting every
 dotted-key segment and header part; set `Parser.MaxTables` before `Parse` to
-change it. Errors quote keys and cut long literals, and never repeat a string
-value. `Marshal` writes a table inline once its header path would pass 256
+change it. Errors quote keys, cut a key or a literal past 32 bytes, and never
+repeat a string value. `Marshal` writes a table inline once its header path would pass 256
 bytes, so output stays linear in depth.
 
 `Marshal` writes an inline table as `{ a = 1 }` and a blank line above each
