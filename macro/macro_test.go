@@ -544,6 +544,8 @@ transitions = [{ target = "GwTR" }, { target = "Wave3", actions = [{ action = "E
 	refuse(t, pylon+"[states]\nA = { macro = \"Pylon\", x = 1, attach = \"G\", next = 2, capture = \"c\" }\n",
 		`states.A: macro "Pylon": unknown argument "capture"`)
 	refuse(t, pylon+"[states]\nA = { macro = \"Pylon\", attach = \"G\", next = 2 }\n", `states.A: macro "Pylon": missing argument "x"`)
+	refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = { capture = \"c\" }\n[states]\nA = { macro = \"M\", request = {}, next = \"N\" }\n",
+		`states.A: macro "M": missing argument "fallback"`)
 	refuse(t, await+"[macros.M]\nbase = \"Await\"\nparams = { timeout_ms = \"int\" }\n",
 		`macro "M": parameter "timeout_ms": the base leaves it open`)
 }
@@ -594,11 +596,17 @@ transitions = [{ target = "N" }, { target = "N", actions = [{ action = "EmitEven
 		`macro "M": with: macro "Await": argument "timeout_ms": want int, got string`)
 	refuse(t, await+"[macros.M]\nbase = \"Await\"\nwith = { capture = \"${side}\" }\n", `macro "M": with.capture: undeclared parameter "side"`)
 
-	// What a value that invokes is, is known once it expands
-	const invokes = await + "[macros.M]\nbase = \"Await\"\nwith = { actions = { macro = \"Emit\", event = \"Lost\", to = \"t1\" } }\n"
-	expand(t, invokes)
-	refuse(t, invokes+"[states]\nA = { macro = \"M\", request = {}, capture = \"c\", next = \"N\", fallback = \"F\" }\n",
-		`states.A: macro "M": with: macro "Await": argument "actions": want array, got table`)
+	// Any other value is checked with its arguments, though its type shows
+	for _, c := range []struct{ with, want string }{
+		{`{ actions = { macro = "Emit", event = "Lost", to = "t1" } }`, `argument "actions": want array, got table`},
+		{`{ timeout_ms = ["${next}"] }`, `argument "timeout_ms": want int, got array`},
+		{`{ timeout_ms = "5 $$" }`, `argument "timeout_ms": want int, got string`},
+	} {
+		late := await + "[macros.M]\nbase = \"Await\"\nwith = " + c.with + "\n"
+		expand(t, late)
+		refuse(t, late+"[states]\nA = { macro = \"M\", request = {}, capture = \"c\", next = \"N\", fallback = \"F\" }\n",
+			`states.A: macro "M": with: macro "Await": `+c.want)
+	}
 }
 
 // The shapes the macros written as one invocation of another take, over their
@@ -746,6 +754,32 @@ func TestTheParameterBoundCountsAllOfAMacroOverABase(t *testing.T) {
 		t.Fatalf("64 parameters, one its own under a name with sets: %v", err)
 	}
 	refuse(t, base+"[macros.M]\nbase = \"B\"\nparams = { own = \"int\" }\n", `macro "M": more than 64 parameters`)
+}
+
+// An open parameter costs its macro what a declared one does and its document
+// nothing: 40000 definitions of two lines over a base of 64 would hold 850 MB
+func TestTheParametersBasesLeaveOpenAreBounded(t *testing.T) {
+	var b, fixed strings.Builder
+	b.WriteString("[macros.B]\nbody = 1\n[macros.B.params]\n")
+	fixed.WriteString("[macros.Fixed]\nbase = \"M0\"\n[macros.Fixed.with]\n")
+	for i := range maxParams {
+		b.WriteString("p" + strconv.Itoa(i) + " = \"int\"\n")
+		fixed.WriteString("p" + strconv.Itoa(i) + " = 1\n")
+	}
+	for i := range maxOpen / maxParams {
+		fmt.Fprintf(&b, "[macros.M%d]\nbase = \"B\"\n", i)
+	}
+	s := NewSet()
+	if err := s.Define(parse(t, b.String())); err != nil {
+		t.Fatalf("%d open parameters: %v", maxOpen, err)
+	}
+	if err := s.Define(parse(t, fixed.String())); err != nil {
+		t.Fatalf("a macro that leaves none open: %v", err)
+	}
+	err := s.Define(parse(t, "[macros.Over]\nbase = \"B\"\nwith = { p0 = 1 }\n"))
+	if err == nil || !strings.Contains(err.Error(), `macro "Over": bases leave more than 65536 parameters open`) {
+		t.Fatalf("63 more through the same set: %v", err)
+	}
 }
 
 // A base is an invocation deeper, as the body it stands for is; a chain no

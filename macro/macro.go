@@ -26,12 +26,14 @@ const (
 const DefaultMaxValues = 1 << 18
 
 // Bounds no document can exceed: invocation nesting, the nesting of a result,
-// which is what Decode and Marshal take, and a macro's parameters, which an
-// invocation flags in one word.
+// which is what Decode and Marshal take, a macro's parameters, which an
+// invocation flags in one word, and the parameters bases leave open through one
+// set, each as costly as a declared one though no document writes it.
 const (
 	maxDepth   = 32
 	maxNesting = 1000
 	maxParams  = 64
+	maxOpen    = 1 << 16
 	maxSteps   = 64 // steps of a path an error spells
 )
 
@@ -154,6 +156,7 @@ type Set struct {
 	MaxValues int
 	macros    map[string]*macro
 	spent     int
+	open      int // parameters its macros take from their bases
 }
 
 func NewSet() *Set { return &Set{} }
@@ -216,8 +219,13 @@ func (s *Set) Define(doc map[string]any) error {
 			} else if base == nil {
 				return fmt.Errorf("macro %s: unknown base %s", quote(m.name), quote(m.base))
 			}
-			if err := m.build(table[m.name].(map[string]any), base); err != nil {
+			def := table[m.name].(map[string]any)
+			if err := m.build(def, base); err != nil {
 				return fmt.Errorf("macro %s: %w", quote(m.name), err)
+			}
+			with, _ := def["with"].(map[string]any)
+			if s.open += len(base.names) - len(with); s.open > maxOpen {
+				return fmt.Errorf("macro %s: bases leave more than %d parameters open", quote(m.name), maxOpen)
 			}
 			s.macros[m.name] = m
 		}

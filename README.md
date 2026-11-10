@@ -329,7 +329,9 @@ bound is an error:
   them, summed over every `Expand`, so a set's documents share one budget;
 - a result nested deeper than 1000 levels, which is what `Decode` and `Marshal`
   take, and a document nested so before it expands;
-- a macro of more than 64 parameters, those a base leaves open among them.
+- a macro of more than 64 parameters, those a base leaves open among them;
+- more than 2^16 parameters left open by bases through one set: each costs its
+  macro what a declared one does, and its document nothing.
 
 An error names the invocation path through every macro involved,
 `states.A: macro "Tower": body.on_enter[0]: unknown macro "Emit"`, each key as a
