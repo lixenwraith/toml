@@ -26,18 +26,20 @@ const (
 const DefaultMaxValues = 1 << 18
 
 // Bounds no document can exceed: invocation nesting, the nesting of a result,
-// which is what Decode and Marshal take, and a macro's parameters, which an
-// invocation flags in one word.
+// which is what Decode and Marshal take, a macro's parameters, which an
+// invocation flags in one word, and the parameters bases leave open through one
+// set, each as costly as a declared one though no document writes it.
 const (
 	maxDepth   = 32
 	maxNesting = 1000
 	maxParams  = 64
+	maxOpen    = 1 << 16
 	maxSteps   = 64 // steps of a path an error spells
 )
 
 var (
 	errDefinitions = errors.New("[macros] is not allowed in this document")
-	errEach        = errors.New("each must be a table of parameter = array")
+	errEach        = errors.New("each must be a table of arguments")
 	errEachValue   = errors.New("each expands only inside an array")
 	errNesting     = fmt.Errorf("nests deeper than %d", maxNesting)
 )
@@ -102,7 +104,9 @@ type macro struct {
 	names    []string // the parameters' names
 	params   []param
 	required uint64 // slots with no default
-	body     node
+	body     node   // over a base, the invocation of it that a body would write
+	part     string // body, or with over a base: the body's name in an error's path
+	base     string // the base's name
 }
 
 func (m *macro) slot(name string) (int, bool) { return slices.BinarySearch(m.names, name) }
@@ -152,6 +156,7 @@ type Set struct {
 	MaxValues int
 	macros    map[string]*macro
 	spent     int
+	open      int // parameters its macros take from their bases
 }
 
 func NewSet() *Set { return &Set{} }
@@ -167,7 +172,8 @@ func ExpandDocument(doc map[string]any) (map[string]any, error) {
 
 // Define moves doc's [macros] into the set, which keeps them. A name defined
 // twice is an error across documents too, so a library cannot silently shadow
-// its user.
+// its user. A base is one of doc's macros, in any order of names, or one the
+// set holds already.
 func (s *Set) Define(doc map[string]any) error {
 	raw, ok := doc[keyMacros]
 	if !ok {
@@ -181,7 +187,9 @@ func (s *Set) Define(doc map[string]any) error {
 	if s.macros == nil {
 		s.macros = make(map[string]*macro)
 	}
-	for _, name := range sortedKeys(table) {
+	names := sortedKeys(table)
+	waiting := map[string]*macro{} // those over a base, until it is built
+	for _, name := range names {
 		if _, dup := s.macros[name]; dup {
 			return fmt.Errorf("macro %s is defined twice", quote(name))
 		}
@@ -189,66 +197,128 @@ func (s *Set) Define(doc map[string]any) error {
 		if err != nil {
 			return fmt.Errorf("macro %s: %w", quote(name), err)
 		}
-		s.macros[name] = m
+		if m.part == "with" {
+			waiting[name] = m
+		} else {
+			s.macros[name] = m
+		}
+	}
+	// A base may sort after the macro over it and be over another in turn, so a
+	// chain of them is built from its far end; a name leaves waiting as it joins
+	// one, so a long chain is walked once and costs no stack
+	for _, name := range names {
+		var chain []*macro
+		for m := waiting[name]; m != nil; m = waiting[m.base] {
+			chain = append(chain, m)
+			delete(waiting, m.name)
+		}
+		for _, m := range slices.Backward(chain) {
+			base := s.macros[m.base]
+			if _, here := table[m.base]; base == nil && here {
+				return fmt.Errorf("macro %s is its own base through %s", quote(m.base), quote(m.name))
+			} else if base == nil {
+				return fmt.Errorf("macro %s: unknown base %s", quote(m.name), quote(m.base))
+			}
+			def := table[m.name].(map[string]any)
+			if err := m.build(def, base); err != nil {
+				return fmt.Errorf("macro %s: %w", quote(m.name), err)
+			}
+			with, _ := def["with"].(map[string]any)
+			if s.open += len(base.names) - len(with); s.open > maxOpen {
+				return fmt.Errorf("macro %s: bases leave more than %d parameters open", quote(m.name), maxOpen)
+			}
+			s.macros[m.name] = m
+		}
 	}
 	return nil
 }
 
+// define reads a definition. One over a base comes back unbuilt: its
+// parameters are its base's too, and the base may not be read yet.
 func define(name string, raw any) (*macro, error) {
 	def, ok := raw.(map[string]any)
 	if !ok {
 		return nil, errors.New("definition must be a table")
 	}
 	for _, key := range sortedKeys(def) {
-		if !slices.Contains([]string{"body", "defaults", "doc", "params"}, key) {
+		if !slices.Contains([]string{"base", "body", "defaults", "doc", "params", "with"}, key) {
 			return nil, fmt.Errorf("unknown key %s", quote(key))
 		}
 	}
 	if _, ok := def["doc"].(string); def["doc"] != nil && !ok {
 		return nil, errors.New("doc must be a string")
 	}
-	body, ok := def["body"]
-	if !ok {
+	_, body := def["body"]
+	base, over := def["base"]
+	_, with := def["with"]
+	m := &macro{name: name, part: "body"}
+	switch {
+	case body && over:
+		return nil, errors.New("body and base are both given")
+	case with && !over:
+		return nil, errors.New("with stands only beside base")
+	case !body && !over:
 		return nil, errors.New("body is missing")
+	case body:
+		return m, m.build(def, nil)
 	}
+	if m.base, ok = base.(string); !ok {
+		return nil, errors.New("base must be a macro's name")
+	}
+	m.part = "with"
+	return m, nil
+}
+
+// build reads m's parameters, defaults and body from its definition. Over a
+// base the body is with, an argument for each parameter of the base.
+func (m *macro) build(def map[string]any, base *macro) error {
 	params, ok := def["params"].(map[string]any)
 	switch {
 	case def["params"] != nil && !ok:
-		return nil, errors.New("params must be a table of name = type")
+		return errors.New("params must be a table of name = type")
 	case len(params) > maxParams:
-		return nil, fmt.Errorf("more than %d parameters", maxParams)
+		return fmt.Errorf("more than %d parameters", maxParams)
 	}
-	m := &macro{name: name, names: sortedKeys(params), params: make([]param, len(params))}
+	m.names, m.params = sortedKeys(params), make([]param, len(params))
 	for slot, key := range m.names {
 		typ, _ := params[key].(string)
 		k := slices.Index(kindNames[:], typ)
 		switch {
 		case !validName(key) || key == keyInvoke || key == keyEach:
-			return nil, fmt.Errorf("parameter %s: not a usable name", quote(key))
+			return fmt.Errorf("parameter %s: not a usable name", quote(key))
 		case k < 0:
-			return nil, fmt.Errorf("parameter %s: type must be one of %s", quote(key), strings.Join(kindNames[:], ", "))
+			return fmt.Errorf("parameter %s: type must be one of %s", quote(key), strings.Join(kindNames[:], ", "))
 		}
 		m.params[slot].kind = kind(k)
 	}
 	m.required = 1<<len(m.params) - 1
+	with, ok := def["with"].(map[string]any)
+	if def["with"] != nil && !ok {
+		return errors.New("with must be a table of arguments")
+	}
+	if base != nil {
+		if err := m.adopt(base, with); err != nil {
+			return err
+		}
+	}
 
 	defaults, ok := def["defaults"].(map[string]any)
 	if def["defaults"] != nil && !ok {
-		return nil, errors.New("defaults must be a table")
+		return errors.New("defaults must be a table")
 	}
 	c := compiler{m: m}
 	for _, key := range sortedKeys(defaults) {
 		slot, ok := m.slot(key)
 		if !ok {
-			return nil, fmt.Errorf("default for undeclared parameter %s", quote(key))
+			return fmt.Errorf("default for undeclared parameter %s", quote(key))
 		}
 		p := &m.params[slot]
 		if !p.kind.holds(defaults[key]) {
-			return nil, fmt.Errorf("default for %s: want %s, got %s", quote(key), kindNames[p.kind], kindName(defaults[key]))
+			return fmt.Errorf("default for %s: want %s, got %s", quote(key), kindNames[p.kind], kindName(defaults[key]))
 		}
 		n, _, err := c.compile(defaults[key], 0)
 		if err != nil {
-			return nil, at(at(err, key), "defaults")
+			return at(at(err, key), "defaults")
 		}
 		p.value, p.def = defaults[key], n
 		m.required &^= 1 << slot
@@ -256,12 +326,67 @@ func define(name string, raw any) (*macro, error) {
 
 	// A reference to an undeclared parameter is a typo; catch it before any use
 	c.template = true
-	n, _, err := c.compile(body, 0)
-	if err != nil {
-		return nil, at(err, "body")
+	if base == nil {
+		n, _, err := c.compile(def["body"], 0)
+		m.body = n
+		return at(err, "body")
 	}
-	m.body = n
-	return m, nil
+	m.body = node{op: opInvoke, elems: []node{{op: opValue, value: base.name, size: 1}}, fields: make([]field, len(base.names))}
+	for slot, key := range base.names {
+		f := &m.body.fields[slot]
+		f.key = key
+		v, set := with[key]
+		if !set {
+			f.node.op = opArg
+			f.node.slot, _ = m.slot(key)
+			continue
+		}
+		n, plain, err := c.compile(v, 1)
+		if err != nil {
+			return at(at(err, key), "with")
+		}
+		// Written without $ and invoking nothing, v is every invocation's
+		// argument, so its type is settled now
+		if k := base.params[slot].kind; plain && !k.holds(v) {
+			return at(in(fmt.Errorf("argument %s: want %s, got %s", quote(key), kindNames[k], kindName(v)), base.name), "with")
+		}
+		f.node = n
+	}
+	return nil
+}
+
+// adopt gives m the parameters of base that with does not set, each with the
+// base's type and default, beside the ones m declares
+func (m *macro) adopt(base *macro, with map[string]any) error {
+	for _, key := range sortedKeys(with) {
+		if _, ok := base.slot(key); !ok {
+			return at(in(fmt.Errorf("unknown argument %s", quote(key)), base.name), "with")
+		}
+	}
+	names := slices.Clone(m.names)
+	for _, key := range base.names {
+		_, set := with[key]
+		if _, declared := m.slot(key); declared && !set {
+			return fmt.Errorf("parameter %s: the base leaves it open", quote(key))
+		} else if !set {
+			names = append(names, key)
+		}
+	}
+	if len(names) > maxParams {
+		return fmt.Errorf("more than %d parameters", maxParams)
+	}
+	slices.Sort(names)
+	params, required := make([]param, len(names)), uint64(0)
+	for slot, key := range names {
+		if own, declared := m.slot(key); declared {
+			params[slot], required = m.params[own], required|1<<slot
+		} else {
+			open, _ := base.slot(key)
+			params[slot], required = base.params[open], required|(base.required>>open&1)<<slot
+		}
+	}
+	m.names, m.params, m.required = names, params, required
+	return nil
 }
 
 // compiler reads a macro's body into the template its invocations instantiate,
@@ -762,7 +887,7 @@ func (e *expander) put(c *call, slot int, v any, h int) error {
 	return nil
 }
 
-// lists reads an each table, whose nesting is h: parameter = array, all one length
+// lists reads an each table, whose nesting is h: its arrays all one length
 func (e *expander) lists(c *call, v any, h int) error {
 	table, ok := v.(map[string]any)
 	if !ok || len(table) == 0 {
@@ -770,7 +895,11 @@ func (e *expander) lists(c *call, v any, h int) error {
 	}
 	base := e.sorted(table)
 	for i := base; i < base+len(table); i++ {
-		if err := e.list(c, e.keys[i], table[e.keys[i]], h-1); err != nil {
+		x, xh := table[e.keys[i]], h-1
+		if _, zipped := x.([]any); !zipped {
+			_, xh = measure(x) // its own nesting, as an argument beside each has
+		}
+		if err := e.list(c, e.keys[i], x, xh); err != nil {
 			return err
 		}
 	}
@@ -778,19 +907,24 @@ func (e *expander) lists(c *call, v any, h int) error {
 	return nil
 }
 
-// list binds one parameter of an each to its array. Keys arrive sorted, as
-// slots are, so the lists stand after the arguments in slot order.
+// list binds one parameter of an each: to its array, an element an expansion,
+// or to a value that is no array, which every expansion shares as an argument
+// beside each. Keys arrive sorted, as slots are, so the arrays stand after the
+// arguments in slot order.
 func (e *expander) list(c *call, key string, v any, h int) error {
 	slot, declared := c.m.slot(key)
 	if !declared {
 		return fmt.Errorf("each: unknown argument %s", quote(key))
 	}
-	list, isArray := v.([]any)
+	list, zipped := v.([]any)
 	switch {
 	case c.given&(1<<slot) != 0:
 		return fmt.Errorf("each: argument %s is also given directly", quote(key))
-	case !isArray:
-		return fmt.Errorf("each: argument %s must be an array", quote(key))
+	case !zipped:
+		if err := e.put(c, slot, v, h); err != nil {
+			return fmt.Errorf("each: %w", err)
+		}
+		return nil
 	case c.each != 0 && len(list) != c.count:
 		return fmt.Errorf("each: argument %s has %d elements, the others %d", quote(key), len(list), c.count)
 	}
@@ -823,7 +957,7 @@ func (e *expander) run(c *call, d int, dst *[]any) (v any, h int, err error) {
 		}
 		x, xh, err := e.inst(&m.body, c, d)
 		if err != nil {
-			return nil, 0, in(at(err, "body"), m.name)
+			return nil, 0, in(at(err, m.part), m.name)
 		}
 		list, splice := x.([]any)
 		switch {

@@ -205,6 +205,8 @@ A macro is a `[macros.<Name>]` table:
 - `defaults`: values for optional parameters; every other parameter is required.
 - `doc`: one line for authors.
 - `body`: any value: a table, an array, a string or a number.
+- `base` and `with`, in place of `body`: the macro is written over another
+  (below).
 
 Inside a body, `${name}` names a parameter, in a string or in a key. A string
 that is exactly one reference becomes the argument itself, of any type;
@@ -213,12 +215,29 @@ or a boolean. `$$` is a literal `$`; any other `$` in a body is an error. Only
 bodies are templates: an argument's own text is never scanned.
 
 Any table with a `macro` key is an invocation; its other keys are arguments,
-checked against the parameters' types. As a value it is replaced by the
-expansion. As an array element, an array expansion is spliced into the array and
-any other is one element; with `each`, a table of parameter = array, all of one
-length, it expands once per zipped element. Bodies may invoke other macros and
+checked against the parameters' types. Bodies may invoke other macros and
 arguments may be invocations: arguments are expanded where they are written,
-then bound, then the body is substituted and expanded in turn.
+then bound, then the body is substituted and expanded in turn. Where an
+invocation stands decides what it becomes:
+
+- a value: the expansion;
+- an array element: an array expansion spliced into the array, any other one
+  element;
+- an array element holding `each`: an expansion for each element of the arrays
+  in `each`, every one spliced or appended so. `each` anywhere else is an error.
+
+`each` is a table of arguments, at least one, read once they are expanded:
+
+- An array is zipped: an element to an expansion, each checked against the
+  parameter's type. The arrays are all of one length.
+- Any other value is shared: every expansion takes it, exactly as it takes an
+  argument written beside `each`, and it is checked against the parameter's
+  type itself.
+- With no array in it, `each` expands once.
+- A parameter named in `each` and also given beside it is an error.
+- An array in `each` is always zipped, whatever its parameter's type: one that
+  every expansion takes whole, for an `array` or `any` parameter, is written
+  beside `each`.
 
 ```toml
 [macros.Note]
@@ -229,19 +248,69 @@ body = { pos = "${pos}", deg = "${deg}", dur = "${dur}", vel = "${vel}" }
 
 [[track]]
 instr = "lead"
-event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4] } }]
+event = [{ macro = "Note", each = { pos = [0, 4, 8], deg = [0, 2, 4], vel = 0.8 } }]
 ```
 
 A default is checked as written and expands where it is used, so one that
 invokes is a `table` or `any` parameter's. A document built in Go may hold any
 integer or float type where the parser gives `int64` and `float64`.
 
+A macro that is one invocation of another is written over it: `base` names the
+other, `with` holds the arguments it fixes.
+
+```toml
+[macros.Line]
+doc = "A line on instr: a note per pos and deg, at one vel or at one each"
+params = { instr = "string", pos = "array", deg = "array", vel = "any", follow = "bool" }
+defaults = { vel = 0.5, follow = true }
+body = { instr = "${instr}", follow_chord = "${follow}", event = [
+  { macro = "Note", each = { pos = "${pos}", deg = "${deg}", vel = "${vel}" } },
+] }
+
+[macros.Lead]
+doc = "A lead line in absolute degrees of the key"
+base = "Line"
+defaults = { instr = "lead" }
+with = { follow = false }
+
+[macros.Stab]
+doc = "One note of the key on a beat"
+base = "Lead"
+params = { beat = "int", deg = "int" }
+with = { pos = ["${beat}"], deg = ["${deg}"] }
+```
+
+- A definition has `body` or `base`, never both, and `with` only beside `base`.
+- `base` is a macro's name as written, never a template: one of the same
+  document's macros, whatever the order of their names, or one the set already
+  holds. A base a later `Define` brings is unknown, and a macro that is its own
+  base through any chain is an error.
+- `with` holds arguments of the base and nothing else: each key is a parameter
+  of the base, so neither `macro` nor `each`.
+- The macro's parameters are the base's that `with` does not set, left open
+  with the base's type and default, and those its own `params` declares: new
+  names, or names `with` sets, where the base's parameter is fixed and the
+  macro's own stands under the name, of whatever type it declares (`deg` above,
+  an array to `Lead` and an integer to `Stab`). Declaring a name the base leaves
+  open is an error.
+- `defaults` gives or replaces the default of any of those parameters, checked
+  against that parameter's type.
+- `with` is a template as a body is: `${name}` names any of the macro's
+  parameters. A value in it written without `$` that invokes nothing is checked
+  against the base's type when the definition is read; any other is checked at
+  expansion, as an argument is.
+- The macro expands exactly as the body `{ macro = <base>, <with>, p = "${p}"
+  for each open parameter p }` would: at that body's cost, one invocation deeper
+  than its base, and refused where that body is, the error naming `with` for
+  `body`. An open parameter left out is so passed its default, and one that
+  invokes expands there.
+
 Definitions are checked when read: an unknown key, an unknown type, a default of
-the wrong type and a `${name}` naming no parameter are errors before any use. A
-body is read once, into the template every invocation instantiates, so an
-expansion costs what it reads and writes: the document, and the values it
-writes. Expansion is a pure function of the documents given, so equal bytes
-expand to equal trees.
+the wrong type, a `${name}` naming no parameter and a `base` or `with` breaking
+a rule above are errors before any use. A body is read once, into the template
+every invocation instantiates, so an expansion costs what it reads and writes:
+the document, and the values it writes. Expansion is a pure function of the
+documents given, so equal bytes expand to equal trees.
 
 `Expand` does not modify its document, and its result shares no table or array
 with the document or the set: writing over a result reaches neither. Arrays
@@ -254,18 +323,21 @@ A document may come from a peer, so every expansion is bounded, and passing a
 bound is an error:
 
 - a macro reached again through its own expansion, and invocations nested
-  deeper than 32;
+  deeper than 32, a base being one;
 - `Set.MaxValues` values written through one set, `DefaultMaxValues` (2^18)
   when zero: each value a body writes, a copied argument's or default's among
   them, summed over every `Expand`, so a set's documents share one budget;
 - a result nested deeper than 1000 levels, which is what `Decode` and `Marshal`
   take, and a document nested so before it expands;
-- a macro of more than 64 parameters.
+- a macro of more than 64 parameters, those a base leaves open among them;
+- more than 2^16 parameters left open by bases through one set: each costs its
+  macro what a declared one does, and its document nothing.
 
 An error names the invocation path through every macro involved,
 `states.A: macro "Tower": body.on_enter[0]: unknown macro "Emit"`, each key as a
-document writes it. What it quotes of a document is cut to 32 bytes and a path
-to 64 steps, so an error stays small whatever the document.
+document writes it, and `with` for `body` in a macro over a base. What it quotes
+of a document is cut to 32 bytes and a path to 64 steps, so an error stays small
+whatever the document.
 
 ## Deliberate subset and deviations
 
