@@ -1,14 +1,15 @@
-// Package macro expands macros in a parsed TOML document. A macro is data
-// under the document's [macros] table; any table carrying a "macro" key invokes
-// one and is replaced by its body with the arguments substituted. Expansion reads
-// nothing but the documents it is given, so equal bytes expand to equal trees on
-// every peer. Syntax: the Macros section of the module README.
+// Package macro expands macros in a parsed TOML document, and folds a value
+// back into them. A macro is data under the document's [macros] table; a table
+// carrying a "macro" key invokes one and is replaced by its body, the arguments
+// substituted. Both read nothing but what they are given, so equal bytes expand
+// to equal trees on every peer. Syntax: the Macros section of the module README.
 package macro
 
 import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"strconv"
@@ -1186,6 +1187,1376 @@ func clone(v any) (any, int) {
 		return out, n
 	}
 	return v, 1
+}
+
+// foldSteps bounds a fold: the steps it may take, a value read, compared or
+// written, for each value of its input times each value the set's macros hold
+const foldSteps = 64
+
+// part is a table or array of a value being folded: its keys sorted or its
+// elements, a scalar as it stands and a table or array a part of its own
+type part struct {
+	table bool
+	lent  bool // an array of values an each took, the fold's own until a fit keeps it
+	run   bool // an element that folds into a run with its neighbours
+	zero  bool // a value a key may leave out: an empty array, a table of nothing else
+	keys  []string
+	kids  []any
+	cost  int   // the values it is written in once folded, a zero under a key none
+	fit   *fit  // a table: the invocation it folds to, nil for none
+	runs  []run // an array: the elements that fold together
+}
+
+// fit is a macro and the arguments under which it expands to a part, or to a
+// run of an array's elements up to to
+type fit struct {
+	m    *macro
+	args []any // by slot: a scalar, a part, or left for one its default gives
+	cost int   // the values the invocation writes
+	save int   // those it writes fewer than what it replaces
+	n    int   // its arguments
+	to   int
+}
+
+type run struct {
+	from int
+	fit
+}
+
+// shape is a macro that expands to a table, and the keys the table may hold as
+// a set of bits, one a key by its hash: every bit where arguments spell a key
+type shape struct {
+	m    *macro
+	keys uint64
+}
+
+// left stands for an argument an invocation leaves to its default, and unknown
+// for a zero an each took of an any parameter: written 0, unless a value that
+// is there says which zero it is
+var (
+	left    = new(part)
+	unknown = &part{cost: 1, zero: true}
+)
+
+// slot is a parameter while a body is matched: free until a value is found for
+// it, bound to one of the input's, blank where all that is known of an any
+// parameter is that it is some zero, plain with one of the set's values, or
+// given by the node an invocation or a default wrote, read in its own frame
+type slot struct {
+	state uint8
+	def   bool // given by the parameter's default
+	val   any
+	node  *node
+	in    frame
+}
+
+const (
+	free uint8 = iota
+	bound
+	blank
+	plain
+	given
+)
+
+// frame is a macro whose body is being matched: its slots are slots[base:]
+type frame struct {
+	m    *macro
+	base int
+}
+
+type folder struct {
+	own     Set // the set's macros under a budget of the fold's own
+	exp     expander
+	tables  []shape  // by name: the macros a table may be an invocation of
+	splices []*macro // those whose expansion an array takes element by element
+	next    []int    // where in an array each of splices is tried next
+	count   int      // the values read
+	parts   int      // the tables and arrays among them
+	named   int      // the keys of the tables
+	steps   int
+	limit   int
+	over    bool
+	careful bool // every fit is expanded before it stands
+	depth   int  // invocations entered
+	eager   int  // elements taken by an each whose length the body leaves open
+	blanks  int  // the values the body in hand writes under keys that hold a zero
+	void    int  // keys entered that hold a zero, or are left out for one
+	shut    int  // parts entered that are folded, whose own keys are not written
+	slots   []slot
+	trail   []int  // the slots bound, so a failed expansion of an each is undone
+	pool    []part // what read has yet to take: parts, their keys, their values
+	keys    []string
+	kids    []any
+	seen    []bool
+	ints    []int
+	vals    []any
+	lists   []part
+	elems   []any
+	args    []any
+	fits    []fit
+}
+
+// Fold returns v, an expanded value, with every table and every run of an
+// array's elements that an invocation of one of the set's macros expands to
+// replaced by that invocation: the inverse of Expand, its rules in the README.
+// v is not modified and the result shares nothing with it. What no macro
+// expands to stays as it is; a fold that passes its bound is an error.
+func (s *Set) Fold(v any) (any, error) {
+	if t, ok := v.(map[string]any); ok {
+		if _, ok := t[keyMacros]; ok {
+			return nil, errDefinitions
+		}
+	}
+	f := folder{own: Set{MaxValues: s.MaxValues, macros: s.macros}}
+	f.exp.set = &f.own
+	if err := f.tally(v, 0); err != nil {
+		return nil, err
+	}
+	f.pool, f.keys, f.kids = make([]part, f.parts+1), make([]string, f.named), make([]any, f.count)
+	root := f.read(v)
+	weight := 1
+	for _, name := range sortedKeys(s.macros) {
+		m := s.macros[name]
+		weight += 1 + m.body.weight()
+		for i := range m.params {
+			weight += m.params[i].def.weight()
+		}
+		n := s.result(m, 0)
+		table, _ := n.value.(map[string]any)
+		switch _, list := n.value.([]any); {
+		case n.op == opArray || list:
+			f.splices = append(f.splices, m)
+		case table != nil:
+			keys := uint64(0)
+			for k := range table {
+				keys |= bit(k)
+			}
+			f.tables = append(f.tables, shape{m, keys})
+		case n.op == opTable:
+			keys := uint64(0)
+			for i := range n.fields {
+				keys |= bit(n.fields[i].key)
+			}
+			if n.dynamic {
+				keys = math.MaxUint64
+			}
+			f.tables = append(f.tables, shape{m, keys})
+		}
+	}
+	f.next = make([]int, len(f.splices))
+	if f.limit = math.MaxInt; f.count < f.limit/foldSteps/weight {
+		f.limit = foldSteps * (f.count + 1) * weight
+	}
+	// A fit is trusted first and the whole result expanded once; only a result
+	// that does not come back has every fit expanded as it is chosen
+	for range 2 {
+		f.fold(root, 0)
+		if out := f.write(root); f.holds(out, root, nil, 0) {
+			return out, nil
+		}
+		f.careful = true
+	}
+	if f.over {
+		return nil, fmt.Errorf("fold exceeds %d steps", f.limit)
+	}
+	out, _ := clone(v)
+	return out, nil
+}
+
+// weight is the values a template holds
+func (n *node) weight() int {
+	if n.op == opStatic {
+		return n.size
+	}
+	w := 1
+	for i := range n.elems {
+		w += n.elems[i].weight()
+	}
+	for i := range n.fields {
+		w += n.fields[i].node.weight()
+	}
+	return w
+}
+
+// result is the node a macro's body writes its value from, through any base
+func (s *Set) result(m *macro, depth int) *node {
+	n := &m.body
+	if n.op == opInvoke && depth < maxDepth {
+		name, _ := n.elems[0].value.(string)
+		if b := s.macros[name]; b != nil {
+			return s.result(b, depth+1)
+		}
+	}
+	return n
+}
+
+// wrote counts a value the body in hand writes under a key holding a zero
+func (f *folder) wrote() {
+	if f.void > 0 && f.shut == 0 {
+		f.blanks++
+	}
+}
+
+func (f *folder) step() bool {
+	if f.steps++; f.steps > f.limit {
+		f.over = true
+	}
+	return !f.over
+}
+
+// tally counts the values of v, its tables and arrays, and the keys of its
+// tables, so that read takes every part from three arrays
+func (f *folder) tally(v any, d int) error {
+	f.count++
+	var err error
+	switch v := v.(type) {
+	case map[string]any:
+		f.parts, f.named = f.parts+1, f.named+len(v)
+		for _, x := range v {
+			if err = cmp.Or(err, f.tally(x, d+1)); d >= maxNesting {
+				return errNesting
+			}
+		}
+	case []any:
+		f.parts++
+		for _, x := range v {
+			if err = cmp.Or(err, f.tally(x, d+1)); d >= maxNesting {
+				return errNesting
+			}
+		}
+	case []map[string]any:
+		f.parts++
+		for _, x := range v {
+			if err = cmp.Or(err, f.tally(x, d+1)); d >= maxNesting {
+				return errNesting
+			}
+		}
+	}
+	return err
+}
+
+// read copies the shape of v into parts
+func (f *folder) read(v any) any {
+	p := &f.pool[0]
+	switch v := v.(type) {
+	case map[string]any:
+		f.pool, p.table, p.keys, p.kids = f.pool[1:], true, f.keys[:0:len(v)], f.kids[:len(v):len(v)]
+		f.keys, f.kids = f.keys[len(v):], f.kids[len(v):]
+		for k := range v {
+			p.keys = append(p.keys, k)
+		}
+		slices.Sort(p.keys)
+		for i, k := range p.keys {
+			p.kids[i] = f.read(v[k])
+		}
+	case []any:
+		f.pool, p.kids, f.kids = f.pool[1:], f.kids[:len(v):len(v)], f.kids[len(v):]
+		for i, x := range v {
+			p.kids[i] = f.read(x)
+		}
+	case []map[string]any:
+		f.pool, p.kids, f.kids = f.pool[1:], f.kids[:len(v):len(v)], f.kids[len(v):]
+		for i, x := range v {
+			p.kids[i] = f.read(x)
+		}
+	default:
+		return v
+	}
+	return p
+}
+
+// fold settles what x and every part under it are written as, the inner first:
+// an argument is itself a folded part, so a fit's cost is known when it is met
+func (f *folder) fold(x any, d int) {
+	p, ok := x.(*part)
+	if !ok || f.over {
+		return
+	}
+	for _, k := range p.kids {
+		f.fold(k, d+1)
+	}
+	// A key holding a zero costs nothing, there or not, so a value costs the same
+	// in every shape the fold calls the same, and folds the same from each
+	p.fit, p.runs, p.run, p.cost, p.zero = nil, p.runs[:0], false, 1, p.table || len(p.kids) == 0
+	keys := uint64(0)
+	for i, k := range p.kids {
+		if !p.table {
+			p.cost += cost(k)
+		} else if keys |= bit(p.keys[i]); !f.zero(k) {
+			p.cost, p.zero = p.cost+cost(k), false
+		}
+	}
+	if p.table {
+		f.table(p, keys, d)
+	} else {
+		f.array(p, d)
+	}
+}
+
+func cost(x any) int {
+	if p, ok := x.(*part); ok {
+		return p.cost
+	}
+	return 1
+}
+
+// table tries every macro on a table whose keys are keys. A macro writes them
+// only if its own include them all, so most are refused before anything is
+// matched; a table holding nothing but zeros is left as it is, or it would
+// fold to an invocation holding one, without end.
+func (f *folder) table(p *part, keys uint64, d int) {
+	for i := 0; i < len(f.tables) && !p.zero && !f.over; i++ {
+		if keys&^f.tables[i].keys != 0 {
+			continue
+		}
+		root := f.enter(f.tables[i].m)
+		if f.match(&root.m.body, root, p, true) {
+			f.found(root, p.cost, 0)
+		}
+		f.leave(root)
+	}
+	if p.fit = f.choose(p, 0, d); p.fit != nil {
+		p.cost = p.fit.cost
+	}
+}
+
+// bit is a key's place in a set of keys
+func bit(key string) uint64 {
+	h := uint32(2166136261)
+	for i := range len(key) {
+		h = (h ^ uint32(key[i])) * 16777619
+	}
+	return 1 << (h >> 26)
+}
+
+// array tries every macro that expands to an array on the elements from each
+// position. One whose each ran over elements is tried again only past them, so
+// a long run is read once, not once from each of its elements.
+func (f *folder) array(p *part, d int) {
+	clear(f.next)
+	for pos := 0; pos < len(p.kids) && len(f.splices) > 0; pos++ {
+		for i := 0; i < len(f.splices) && !f.over; i++ {
+			if f.next[i] > pos {
+				continue
+			}
+			root := f.enter(f.splices[i])
+			f.eager = 0
+			if to, ok := f.splice(&root.m.body, root, p.kids, pos, len(p.kids)); ok && to > pos {
+				most := 0
+				for _, k := range p.kids[pos:to] {
+					most += cost(k)
+				}
+				f.found(root, most, to)
+			}
+			f.leave(root)
+			f.next[i] = pos + f.eager
+		}
+		if c := f.choose(p, pos, d); c != nil {
+			for _, k := range p.kids[pos:c.to] {
+				if q, ok := k.(*part); ok {
+					q.run = true
+				}
+			}
+			p.runs = append(p.runs, run{pos, *c})
+			p.cost -= c.save
+			pos = c.to - 1
+		}
+	}
+}
+
+// found notes the macro whose body just matched, unless its invocation would
+// write more than the most values it replaces: its arguments, one equal to its
+// default left out, and one nothing settled given its type's zero value
+func (f *folder) found(fr frame, most, to int) {
+	m, at, blanks := fr.m, len(f.args), f.blanks
+	c := fit{m: m, cost: 2, to: to}
+	for i := range m.params {
+		s, v := f.slots[fr.base+i], any(left)
+		switch required := m.required>>i&1 != 0; {
+		case s.state != free && (required || !f.defaulted(&m.params[i], s.val, s.state == bound)):
+			v = s.val
+		case s.state == free && required:
+			v = zero(m.params[i].kind)
+		}
+		if v != any(left) {
+			c.cost, c.n = c.cost+cost(v), c.n+1
+		}
+		f.args = append(f.args, v)
+	}
+	// What the invocation replaces is the table as its macro writes it, the
+	// zeros a struct leaves out among them, so that an entry the author wrote
+	// as an invocation stays one from a struct's shape
+	if c.save = most - c.cost; c.save+blanks < 0 {
+		f.args = f.args[:at]
+		return
+	}
+	c.args = f.args[at:]
+	f.fits = append(f.fits, c)
+}
+
+// defaulted reports v is what leaving the argument out gives, or with here
+// false that any zero is. An array is not where the default invokes: as an
+// array's element that would be spliced.
+func (f *folder) defaulted(p *param, v any, here bool) bool {
+	if a, ok := v.(*part); ok && !a.table && p.def.op == opInvoke {
+		return false
+	}
+	return f.match(&p.def, frame{}, v, here)
+}
+
+// choose takes the fit found for p, or for its elements from pos, that saves
+// the most values, then has the fewest arguments, then the first name; when
+// careful, the first of them that expands to what it replaces
+func (f *folder) choose(p *part, pos, d int) (best *fit) {
+	slices.SortFunc(f.fits, func(a, b fit) int {
+		return cmp.Or(cmp.Compare(b.save, a.save), cmp.Compare(a.n, b.n), cmp.Compare(a.m.name, b.m.name))
+	})
+	for i := range f.fits {
+		c := &f.fits[i]
+		var kids []any
+		if !p.table {
+			kids = p.kids[pos:c.to]
+		}
+		if !f.careful || f.holds(f.invocation(c), p, kids, d) {
+			best = &fit{}
+			*best = *c
+			best.args = slices.Clone(c.args)
+			for i, v := range best.args {
+				best.args[i] = keep(v)
+			}
+			break
+		}
+	}
+	f.fits, f.args, f.lists, f.elems = f.fits[:0], f.args[:0], f.lists[:0], f.elems[:0]
+	return best
+}
+
+// keep is an argument of a fit that stands, an array the fold lent it copied:
+// the fold takes the next part's arrays from the same place
+func keep(v any) any {
+	p, ok := v.(*part)
+	if !ok || !p.lent {
+		return v
+	}
+	out := &part{kids: slices.Clone(p.kids), cost: p.cost, zero: p.zero}
+	for i, k := range out.kids {
+		out.kids[i] = keep(k)
+	}
+	return out
+}
+
+// holds expands v with the expander itself and reports the result is what it
+// replaces: x, or kids where v is an array's element at depth d. What it spends
+// counts toward the fold's bound and stays within a budget of the set's size.
+func (f *folder) holds(v, x any, kids []any, d int) bool {
+	if f.over {
+		return false
+	}
+	e := &f.exp
+	e.limit = min(cmp.Or(f.own.MaxValues, DefaultMaxValues), f.limit-f.steps)
+	e.stack, e.args, e.keys, f.own.spent = e.stack[:0], e.args[:0], e.keys[:0], 0
+	var out any
+	var err error
+	if kids == nil {
+		out, _, err = e.walk(v, d)
+	} else if out, _, err = e.element(v, 0, d, nil, 0); err == nil && len(out.([]any)) != len(kids) {
+		err = errEach
+	}
+	if f.steps += f.own.spent; err != nil || !f.step() {
+		return false
+	}
+	if kids == nil {
+		return f.same(out, x)
+	}
+	for i, k := range kids {
+		if !f.same(out.([]any)[i], k) {
+			return false
+		}
+	}
+	return true
+}
+
+// write is x as it folds: a value of the caller's own
+func (f *folder) write(x any) any {
+	p, ok := x.(*part)
+	switch {
+	case !ok:
+		return x
+	case p == unknown:
+		return int64(0)
+	case p.fit != nil:
+		return f.invocation(p.fit)
+	case p.table:
+		out := make(map[string]any, len(p.keys))
+		for i, k := range p.keys {
+			out[k] = f.write(p.kids[i])
+		}
+		return out
+	}
+	out, runs := make([]any, 0, len(p.kids)), p.runs
+	for i := 0; i < len(p.kids); i++ {
+		if len(runs) > 0 && runs[0].from == i {
+			out, i, runs = append(out, f.invocation(&runs[0].fit)), runs[0].to-1, runs[1:]
+		} else {
+			out = append(out, f.write(p.kids[i]))
+		}
+	}
+	return out
+}
+
+func (f *folder) invocation(c *fit) any {
+	out := make(map[string]any, c.n+1)
+	out[keyInvoke] = c.m.name
+	for i, v := range c.args {
+		if v != any(left) {
+			out[c.m.names[i]] = f.write(v)
+		}
+	}
+	return out
+}
+
+// enter opens a frame for m, its parameters free
+func (f *folder) enter(m *macro) frame {
+	base := len(f.slots)
+	if base == 0 {
+		f.trail, f.blanks, f.void = f.trail[:0], 0, 0
+	}
+	f.slots = append(f.slots, make([]slot, len(m.params))...)
+	f.depth++
+	return frame{m, base}
+}
+
+func (f *folder) leave(fr frame) {
+	clear(f.slots[fr.base:])
+	f.slots = f.slots[:fr.base]
+	f.depth--
+}
+
+// invoke opens the frame of the macro an invocation in a body names, each
+// argument given by the node the invocation writes for it. It fails where the
+// name is spelled from arguments, which is left alone.
+func (f *folder) invoke(n *node, fr frame) (frame, bool) {
+	name, _ := n.elems[0].value.(string)
+	m := f.own.macros[name]
+	if n.elems[0].op != opValue || m == nil || f.depth >= maxDepth {
+		return frame{}, false
+	}
+	// Arguments and parameters are both sorted by name, so they are merged
+	in, j := f.enter(m), 0
+	for i := range n.fields {
+		for j < len(m.names) && m.names[j] < n.fields[i].key {
+			j++
+		}
+		if j == len(m.names) || m.names[j] != n.fields[i].key {
+			f.leave(in)
+			return frame{}, false
+		}
+		f.slots[in.base+j] = slot{state: given, node: &n.fields[i].node, in: fr}
+	}
+	return in, true
+}
+
+// defaults gives every parameter still free its default, but those an each
+// binds; one with no default is an argument missing
+func (f *folder) defaults(in frame, each uint64) bool {
+	for i := range in.m.params {
+		if s := &f.slots[in.base+i]; s.state == free && each>>i&1 == 0 {
+			if in.m.required>>i&1 != 0 {
+				return false
+			}
+			*s = slot{state: given, def: true, node: &in.m.params[i].def}
+		}
+	}
+	return true
+}
+
+// match reports the node, instantiated in fr, is x, or with here false is a
+// zero value a key may leave out. A free parameter it meets is bound to what
+// stands there.
+func (f *folder) match(n *node, fr frame, x any, here bool) bool {
+	if !f.step() {
+		return false
+	}
+	p, _ := x.(*part)
+	shut := 0
+	if p != nil && (p.fit != nil || p.run) {
+		shut = 1
+	}
+	if n.op != opStatic && n.op != opArg && n.op != opInvoke {
+		f.wrote()
+	}
+	switch n.op {
+	case opValue:
+		if !here {
+			return zeroScalar(n.value)
+		}
+		return sameScalar(n.value, x)
+	case opStatic:
+		if !here {
+			return f.blank(n.value)
+		}
+		return f.same(n.value, x)
+	case opArg:
+		return f.arg(fr, n.slot, x, here)
+	case opText:
+		s, ok := x.(string)
+		return ok && f.text(n.segs, fr, s)
+	case opArray:
+		if here && (p == nil || p.table) {
+			return false
+		}
+		var kids []any
+		if here {
+			kids = p.kids
+		}
+		f.shut += shut
+		to, ok := f.elements(n, fr, kids, 0, len(kids))
+		f.shut -= shut
+		return ok && to == len(kids)
+	case opTable:
+		if here && (p == nil || !p.table) {
+			return false
+		}
+		var keys []string
+		var kids []any
+		if here {
+			keys, kids = p.keys, p.kids
+		}
+		base, at := len(f.seen), len(f.ints)
+		f.seen, f.shut = append(f.seen, make([]bool, len(keys))...), f.shut+shut
+		ok := f.fields(n, fr, keys, kids, base, at)
+		f.seen, f.ints, f.shut = f.seen[:base], f.ints[:at], f.shut-shut
+		return ok
+	}
+	if len(n.elems) > 1 {
+		return false // each expands only inside an array
+	}
+	in, ok := f.invoke(n, fr)
+	if !ok {
+		return false
+	}
+	ok = f.defaults(in, 0) && f.match(&in.m.body, in, x, here)
+	f.leave(in)
+	return ok
+}
+
+// arg matches x against a parameter: through the node that gives it, against
+// the value it holds, or, free, by binding it to x
+func (f *folder) arg(fr frame, i int, x any, here bool) bool {
+	switch s := f.slots[fr.base+i]; s.state {
+	case given:
+		return f.match(s.node, s.in, x, here)
+	case plain:
+		if !here {
+			return f.blank(s.val)
+		}
+		return f.same(s.val, x)
+	case bound:
+		if f.wrote(); !here {
+			return f.zero(s.val)
+		}
+		return f.equal(s.val, x)
+	case blank:
+		if here && !f.zero(x) {
+			return false
+		}
+	}
+	f.wrote()
+	// An absent key is a zero of the parameter's type; of an any parameter it
+	// says no more than that, until a key that is there says which zero
+	k, state := fr.m.params[i].kind, bound
+	if !here {
+		if x = zero(k); k == kindAny {
+			state = blank
+		}
+	} else if x, here = take(k, x); !here {
+		return false
+	}
+	f.slots[fr.base+i] = slot{state: state, val: x}
+	f.trail = append(f.trail, fr.base+i)
+	return true
+}
+
+// undo frees the slots bound since mark that are still open
+func (f *folder) undo(mark int) {
+	for _, i := range f.trail[mark:] {
+		if i < len(f.slots) {
+			f.slots[i] = slot{}
+		}
+	}
+	f.trail = f.trail[:mark]
+}
+
+// take is x as a parameter of kind k takes it, a whole float as the integer an
+// int parameter wants, so a value folds the same whichever of the two it holds
+func take(k kind, x any) (any, bool) {
+	if p, ok := x.(*part); ok {
+		return x, k == kindAny || k == kindTable && p.table || k == kindArray && !p.table
+	}
+	if _, fl, nk := number(x); k == kindInt && nk == kindFloat && float64(int64(fl)) == fl {
+		return int64(fl), true
+	}
+	return x, k.holds(x)
+}
+
+// zero is the value an absent key stands for, to a parameter of kind k
+func zero(k kind) any {
+	switch k {
+	case kindArray:
+		return &part{cost: 1, zero: true}
+	case kindTable:
+		return &part{table: true, cost: 1, zero: true}
+	case kindBool:
+		return false
+	case kindFloat:
+		return 0.0
+	case kindString:
+		return ""
+	}
+	return int64(0)
+}
+
+// fields matches a table: its fields under their keys, then those whose key is
+// spelled from arguments, and no key of the table left over. A field that is a
+// comparison goes before one that reads a table or an array, so a macro that
+// does not fit is refused before its long parts are read.
+func (f *folder) fields(n *node, fr frame, keys []string, kids []any, base, at int) bool {
+	// Fields and keys are both sorted, so a field's key is mostly the next one
+	found, next := 0, 0
+	for i := range n.fields {
+		j, ok := next, next < len(keys) && keys[next] == n.fields[i].key
+		if !ok {
+			j, ok = slices.BinarySearch(keys, n.fields[i].key)
+		}
+		if ok = ok && n.fields[i].segs == nil; ok {
+			f.seen[base+j], found, next = true, found+1, j+1
+		} else {
+			j = -1
+		}
+		f.ints = append(f.ints, j)
+	}
+	if !n.dynamic && found < len(keys) {
+		return false
+	}
+	for _, deep := range [2]bool{false, true} {
+		for i := range n.fields {
+			fld := &n.fields[i]
+			if fld.segs != nil || deep != (fld.node.op >= opArray) {
+				continue
+			}
+			var x any
+			j, void := f.ints[at+i], 1
+			if j >= 0 {
+				if x = kids[j]; !f.zero(x) {
+					void = 0
+				}
+			}
+			f.void += void
+			ok := f.match(&fld.node, fr, x, j >= 0)
+			if f.void -= void; !ok {
+				return false
+			}
+		}
+	}
+	for i := range n.fields {
+		if fld := &n.fields[i]; fld.segs != nil && !f.spelled(fld, fr, keys, kids, base) {
+			return false
+		}
+	}
+	return !slices.Contains(f.seen[base:base+len(keys)], false)
+}
+
+// spelled matches a field whose key is spelled from arguments, under the one
+// key still untaken that its text fits; none, or more than one, is not settled
+func (f *folder) spelled(fld *field, fr frame, keys []string, kids []any, base int) bool {
+	at, mark := -1, len(f.trail)
+	for j, k := range keys {
+		if !f.seen[base+j] && f.text(fld.segs, fr, k) {
+			if f.undo(mark); at >= 0 {
+				return false
+			}
+			at = j
+		}
+	}
+	if at < 0 || !f.text(fld.segs, fr, keys[at]) {
+		return false
+	}
+	f.seen[base+at] = true
+	if f.zero(kids[at]) {
+		f.void++
+		defer func() { f.void-- }()
+	}
+	return f.match(&fld.node, fr, kids[at], true)
+}
+
+// text matches s against a template's text. With every reference known it is
+// the text they spell; one free reference takes what the text around it
+// leaves; more than one is a split nothing settles.
+func (f *folder) text(segs []segment, fr frame, s string) bool {
+	open := -1
+	for i := range segs {
+		if t, ok := f.piece(&segs[i], fr); !ok && open >= 0 {
+			return false
+		} else if !ok {
+			open = i
+		} else if open < 0 && strings.HasPrefix(s, t) {
+			s = s[len(t):]
+		} else if open < 0 {
+			return false
+		}
+	}
+	if open < 0 {
+		return s == ""
+	}
+	for i := len(segs) - 1; i > open; i-- {
+		t, _ := f.piece(&segs[i], fr)
+		if !strings.HasSuffix(s, t) {
+			return false
+		}
+		s = s[:len(s)-len(t)]
+	}
+	var v any = s
+	switch k := fr.m.params[segs[open].slot].kind; k {
+	case kindInt, kindFloat:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if v = n; err != nil || strconv.FormatInt(n, 10) != s {
+			return false
+		}
+	case kindBool:
+		if v = s == "true"; s != "true" && s != "false" {
+			return false
+		}
+	case kindArray, kindTable:
+		return false
+	}
+	return f.arg(fr, segs[open].slot, v, true)
+}
+
+// piece is the text a segment splices in, once it is known: its own, or its
+// parameter's value, a string, an integer or a boolean
+func (f *folder) piece(seg *segment, fr frame) (string, bool) {
+	if seg.slot < 0 {
+		return seg.text, true
+	}
+	s := f.slots[fr.base+seg.slot]
+	for s.state == given && s.node.op == opArg {
+		s = f.slots[s.in.base+s.node.slot]
+	}
+	if s.state == given && s.node.op == opValue {
+		s.state, s.val = plain, s.node.value
+	}
+	switch v := s.val.(type) {
+	case string:
+		return v, s.state == bound || s.state == plain
+	case bool:
+		return strconv.FormatBool(v), s.state == bound || s.state == plain
+	}
+	i, _, k := number(s.val)
+	return strconv.FormatInt(i, 10), k == kindInt && (s.state == bound || s.state == plain)
+}
+
+// resolve follows a reference to the node its parameter is given by, and stops
+// at one whose parameter is free or holds a value
+func (f *folder) resolve(n *node, fr frame) (*node, frame) {
+	for n.op == opArg {
+		s := f.slots[fr.base+n.slot]
+		if s.state != given {
+			break
+		}
+		n, fr = s.node, s.in
+	}
+	return n, fr
+}
+
+// elements matches a body's array against kids[pos:end] and returns where it
+// stops. An invocation takes what it expands to, and leaves an element for each
+// plain one after it.
+func (f *folder) elements(n *node, fr frame, kids []any, pos, end int) (int, bool) {
+	rest := 0
+	for i := range n.elems {
+		if n.elems[i].op != opInvoke {
+			rest++
+		}
+	}
+	for i := range n.elems {
+		el, in, ok := &n.elems[i], fr, false
+		if el.op != opInvoke {
+			rest--
+		}
+		// A default that invokes expands where it is used, here as an element
+		if s := f.slots; el.op == opArg && s[fr.base+el.slot].def && s[fr.base+el.slot].node.op == opInvoke {
+			el, in = s[fr.base+el.slot].node, frame{}
+		}
+		switch {
+		case el.op == opInvoke:
+			pos, ok = f.each(el, in, kids, pos, end-rest)
+		case pos < end-rest && f.match(el, in, kids[pos], true):
+			pos, ok = pos+1, true
+		}
+		if !ok {
+			return pos, false
+		}
+	}
+	return pos, true
+}
+
+// splice matches what an invocation's body gives an array: the elements of an
+// array one by one, any other value as one element
+func (f *folder) splice(n *node, fr frame, kids []any, pos, end int) (int, bool) {
+	if !f.step() {
+		return pos, false
+	}
+	var list []any
+	switch n.op {
+	case opArray:
+		return f.elements(n, fr, kids, pos, end)
+	case opInvoke:
+		in, ok := f.invoke(n, fr)
+		if !ok || len(n.elems) > 1 {
+			return pos, false
+		}
+		if ok = f.defaults(in, 0); ok {
+			pos, ok = f.splice(&in.m.body, in, kids, pos, end)
+		}
+		f.leave(in)
+		return pos, ok
+	case opArg:
+		switch s := f.slots[fr.base+n.slot]; s.state {
+		case given:
+			return f.splice(s.node, s.in, kids, pos, end)
+		case bound:
+			if p, ok := s.val.(*part); ok && !p.table {
+				for _, k := range p.kids {
+					if pos >= end || !f.equal(k, kids[pos]) {
+						return pos, false
+					}
+					pos++
+				}
+				return pos, true
+			}
+		case plain:
+			list, _ = s.val.([]any)
+		case free, blank:
+			return pos, false // one element or several: nothing settles which
+		}
+	case opStatic:
+		list, _ = n.value.([]any)
+	}
+	if list != nil {
+		for _, v := range list {
+			if pos >= end || !f.same(v, kids[pos]) {
+				return pos, false
+			}
+			pos++
+		}
+		return pos, true
+	}
+	if pos >= end || !f.match(n, fr, kids[pos], true) {
+		return pos, false
+	}
+	return pos + 1, true
+}
+
+// each matches an invocation that is an array's element: its body once, or
+// once for each element of the arrays in its each. Where every array is an
+// argument still free, the body is matched for as long as it fits, and each
+// such argument comes back as the values it took.
+func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
+	in, ok := f.invoke(n, fr)
+	if !ok {
+		return pos, false
+	}
+	defer f.leave(in)
+	if len(n.elems) == 1 {
+		if !f.defaults(in, 0) {
+			return pos, false
+		}
+		return f.splice(&in.m.body, in, kids, pos, end)
+	}
+	lists, lf := f.resolve(&n.elems[1], fr)
+	if lists.op != opTable || lists.dynamic || len(lists.fields) == 0 {
+		return pos, false
+	}
+	// The slots each binds; the fields whose argument is still free, loose, and
+	// those of them whose argument cannot be an array, fixed. A field's slot and
+	// its argument's, -1 unless loose, go on ints.
+	var each, loose, fixed uint64
+	count, open, at, arrays := -1, 0, len(f.ints), false
+	defer func() { f.ints = f.ints[:at] }()
+	for i := range lists.fields {
+		j, ok := in.m.slot(lists.fields[i].key)
+		if !ok || f.slots[in.base+j].state != free {
+			return pos, false
+		}
+		each |= 1 << j
+		outer := -1
+		switch _, n := f.nth(&lists.fields[i].node, lf, 0); {
+		case n == isFree:
+			arg, fr := f.resolve(&lists.fields[i].node, lf)
+			if k := fr.m.params[arg.slot].kind; k == kindAny || k == kindArray {
+				arrays = true
+			} else {
+				fixed |= 1 << i
+			}
+			outer, loose, open = fr.base+arg.slot, loose|1<<i, open+1
+		case n >= 0 && count >= 0 && n != count:
+			return pos, false
+		case n >= 0:
+			count = n
+		}
+		f.ints = append(f.ints, in.base+j, outer)
+	}
+	if !f.defaults(in, each) {
+		return pos, false
+	}
+	// With no array in it, each expands once; so it does where none of its
+	// arguments still free can be one
+	if count < 0 && !arrays {
+		count = 1
+	}
+	known := count >= 0
+	base, done, unset := len(f.vals), 0, loose
+	defer func() { f.vals = f.vals[:base] }()
+	for ; !known || done < count; done++ {
+		mark, blanks := len(f.trail), f.blanks
+		for i := range lists.fields {
+			f.slots[f.ints[at+2*i]], _ = f.nth(&lists.fields[i].node, lf, done)
+		}
+		next, ok := f.splice(&in.m.body, in, kids, pos, end)
+		for i := 0; i < len(lists.fields) && ok; i++ {
+			if j := f.ints[at+2*i]; loose>>i&1 != 0 {
+				v := f.slots[j].val
+				switch f.slots[j].state {
+				case free:
+					v = zero(in.m.params[j-in.base].kind)
+				case blank:
+					v, unset = unknown, unset&^(1<<i)
+				default:
+					unset &^= 1 << i
+				}
+				f.vals = append(f.vals, v)
+			}
+		}
+		// A run ends before an expansion its arguments could not spell: one that
+		// gives an argument which is no array a second value, or one argument two
+		ok = ok && f.spells(lists, loose&^unset, fixed, f.ints[at:], f.vals[base:], done, open)
+		if !ok && known {
+			return pos, false
+		} else if !ok || next == pos && !known {
+			f.vals = f.vals[:base+done*open]
+			f.undo(mark)
+			f.blanks = blanks
+			break
+		}
+		pos = next
+	}
+	if !known {
+		f.eager += done
+	}
+	return pos, f.gather(lists, lf, loose, unset, f.vals[base:], done, known)
+}
+
+// spells reports the values the latest expansion of an each took can stand
+// with those before: set are the loose fields an expansion has read, their
+// arguments' slots at ints[2*i+1], and vals holds open values an expansion
+func (f *folder) spells(lists *node, set, fixed uint64, ints []int, vals []any, done, open int) bool {
+	c := 0
+	for i := range lists.fields {
+		if ints[2*i+1] < 0 {
+			continue
+		}
+		v := vals[done*open+c]
+		if set>>i&1 != 0 && fixed>>i&1 != 0 && done > 0 && !f.equal(vals[c], v) {
+			return false
+		}
+		for j, d := 0, 0; j < i && set>>i&1 != 0; j++ {
+			if ints[2*j+1] == ints[2*i+1] && set>>j&1 != 0 && !f.equal(vals[done*open+d], v) {
+				return false
+			}
+			if ints[2*j+1] >= 0 {
+				d++
+			}
+		}
+		c++
+	}
+	return true
+}
+
+const (
+	isShared = -1 - iota // what nth reports of a value that is no array
+	isFree
+)
+
+// nth is what an each gives a parameter in its expansion i, and the length of
+// the array that comes from: isShared for a value every expansion takes,
+// isFree for an argument nothing has settled yet
+func (f *folder) nth(n *node, fr frame, i int) (slot, int) {
+	n, fr = f.resolve(n, fr)
+	var list []any
+	switch n.op {
+	case opArg:
+		s := f.slots[fr.base+n.slot]
+		if s.state == free {
+			return slot{}, isFree
+		}
+		if p, ok := s.val.(*part); ok && !p.table {
+			if i < len(p.kids) {
+				s.val = p.kids[i]
+			}
+			return s, len(p.kids)
+		}
+		if list, _ = s.val.([]any); list == nil {
+			return s, isShared
+		}
+	case opArray:
+		if i < len(n.elems) {
+			return slot{state: given, node: &n.elems[i], in: fr}, len(n.elems)
+		}
+		return slot{}, len(n.elems)
+	case opStatic:
+		list, _ = n.value.([]any)
+	}
+	if list == nil {
+		return slot{state: given, node: n, in: fr}, isShared
+	}
+	if i < len(list) {
+		return slot{state: plain, val: list[i]}, len(list)
+	}
+	return slot{}, len(list)
+}
+
+// gather binds the arguments an each left free to the values its expansions
+// took, done of them for each loose field in turn: their array, or one value
+// where they all agree and the parameter takes one, which a field in unset,
+// that no expansion read, leaves free. Where no array is left to count the
+// expansions by, the first argument that can be one is.
+func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, done int, known bool) bool {
+	open, counted := bits.OnesCount64(loose), known || done == 1
+	if f.steps += done; !f.step() {
+		return false
+	}
+	var arrays uint64 // the loose fields, in their order, whose values stay an array
+	for pass := range 2 {
+		c := 0
+		for i := range lists.fields {
+			if loose>>i&1 == 0 {
+				continue
+			}
+			n, fr := f.resolve(&lists.fields[i].node, lf)
+			k := fr.m.params[n.slot].kind
+			switch {
+			case pass == 0:
+				agree := done > 0
+				for j := 1; j < done && agree; j++ {
+					agree = f.equal(vals[c], vals[j*open+c])
+				}
+				if agree {
+					a, _ := vals[c].(*part)
+					_, agree = take(k, vals[c])
+					agree = agree && (a == nil || a.table) || a == unknown && k != kindArray
+				}
+				if !agree && done > 0 {
+					arrays, counted = arrays|1<<c, true
+				}
+			case !counted && (k == kindAny || k == kindArray), arrays>>c&1 != 0:
+				at := len(f.elems)
+				f.elems = append(f.elems, make([]any, done)...)
+				f.lists = append(f.lists, part{kids: f.elems[at:len(f.elems):len(f.elems)], cost: 1, lent: true, zero: done == 0})
+				list := &f.lists[len(f.lists)-1]
+				for j := range done {
+					list.kids[j] = vals[j*open+c]
+					list.cost += cost(list.kids[j])
+				}
+				if counted = true; !f.arg(fr, n.slot, list, true) {
+					return false
+				}
+			case done > 0 && unset>>i&1 == 0:
+				// The value they agree on is the first that says what it is
+				v := any(unknown)
+				for j := 0; j < done && v == any(unknown); j++ {
+					v = vals[j*open+c]
+				}
+				if !f.arg(fr, n.slot, v, v != any(unknown)) {
+					return false
+				}
+			}
+			c++
+		}
+	}
+	return counted
+}
+
+// same reports v, a value of the set or of an expansion, is x under the fold's
+// rule: v may hold a key x leaves out, where it holds a zero value, and an
+// integer may stand for the float of its value
+func (f *folder) same(v, x any) bool {
+	if f.wrote(); !f.step() {
+		return false
+	}
+	p, _ := x.(*part)
+	table, _ := v.(map[string]any)
+	list, isList := v.([]any)
+	switch {
+	case p == unknown:
+		return f.blank(v)
+	case table == nil && !isList:
+		return p == nil && sameScalar(v, x)
+	case p == nil || p.table == isList || isList && len(list) != len(p.kids):
+		return false
+	case p.fit != nil || p.run:
+		f.shut++
+		defer func() { f.shut-- }()
+	}
+	for i := range list {
+		if !f.same(list[i], p.kids[i]) {
+			return false
+		}
+	}
+	for i, k := range p.keys {
+		w, ok := table[k]
+		void := 0
+		if f.zero(p.kids[i]) {
+			void = 1
+		}
+		f.void += void
+		ok = ok && f.same(w, p.kids[i])
+		if f.void -= void; !ok {
+			return false
+		}
+	}
+	// Every key is read whatever a map's order, so a fold's steps are its
+	// input's alone
+	ok := true
+	f.void++
+	for k, w := range table {
+		if _, held := slices.BinarySearch(p.keys, k); len(p.keys) < len(table) && !held {
+			ok = f.blank(w) && ok
+		}
+	}
+	f.void--
+	return ok
+}
+
+// equal is same of a, a value of the fold's input written where b stands
+func (f *folder) equal(a, b any) bool {
+	if !f.step() {
+		return false
+	}
+	p, _ := a.(*part)
+	q, _ := b.(*part)
+	switch {
+	case p == unknown || q == unknown:
+		return f.zero(a) && f.zero(b)
+	case p == nil || q == nil:
+		return p == nil && q == nil && sameScalar(a, b)
+	case p.table != q.table || !p.table && len(p.kids) != len(q.kids):
+		return false
+	case !p.table:
+		for i := range p.kids {
+			if !f.equal(p.kids[i], q.kids[i]) {
+				return false
+			} else if p.kids[i] == any(unknown) {
+				p.kids[i] = q.kids[i]
+			}
+		}
+		return true
+	}
+	j := 0
+	for i, k := range p.keys {
+		if j < len(q.keys) && q.keys[j] == k {
+			if !f.equal(p.kids[i], q.kids[j]) {
+				return false
+			}
+			j++
+		} else if !f.zero(p.kids[i]) {
+			return false
+		}
+	}
+	return j == len(q.keys)
+}
+
+// zero reports x, a value of the fold's input, is one a key may leave out
+func (f *folder) zero(x any) bool {
+	if p, ok := x.(*part); ok {
+		return p.zero
+	}
+	return zeroScalar(x)
+}
+
+// blank is zero of a value of the set or of an expansion, read whole and
+// counted where it stands under a key
+func (f *folder) blank(v any) bool {
+	f.wrote()
+	switch v := v.(type) {
+	case map[string]any:
+		ok := f.step()
+		for _, w := range v {
+			ok = f.blank(w) && ok
+		}
+		return ok
+	case []any:
+		return len(v) == 0
+	}
+	return zeroScalar(v)
+}
+
+func zeroScalar(v any) bool {
+	switch v := v.(type) {
+	case string:
+		return v == ""
+	case bool:
+		return !v
+	}
+	i, fl, k := number(v)
+	return k != kindOther && i == 0 && fl == 0
+}
+
+// sameScalar reports two scalars are one value, an integer and the float of
+// exactly its value among them
+func sameScalar(a, b any) bool {
+	ai, af, ak := number(a)
+	bi, bf, bk := number(b)
+	switch {
+	case ak == kindOther || bk == kindOther:
+		k := kindOf(a)
+		return (k == kindString || k == kindBool) && a == b
+	case ak == bk:
+		return ai == bi && af == bf
+	case ak == kindInt:
+		return int64(bf) == ai && float64(ai) == bf
+	}
+	return int64(af) == bi && float64(bi) == af
+}
+
+// number reads an integer or a float of any Go type a document may hold
+func number(v any) (int64, float64, kind) {
+	switch v := v.(type) {
+	case int64:
+		return v, 0, kindInt
+	case float64:
+		return 0, v, kindFloat
+	case int:
+		return int64(v), 0, kindInt
+	case int8:
+		return int64(v), 0, kindInt
+	case int16:
+		return int64(v), 0, kindInt
+	case int32:
+		return int64(v), 0, kindInt
+	case uint:
+		return int64(v), 0, kindInt
+	case uint8:
+		return int64(v), 0, kindInt
+	case uint16:
+		return int64(v), 0, kindInt
+	case uint32:
+		return int64(v), 0, kindInt
+	case uint64:
+		return int64(v), 0, kindInt
+	case float32:
+		return 0, float64(v), kindFloat
+	}
+	return 0, 0, kindOther
 }
 
 // pathError is an error and where it happened, a step added by each value the

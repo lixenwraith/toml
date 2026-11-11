@@ -201,3 +201,32 @@ func TestMarshal_SkipNil(t *testing.T) {
 		t.Errorf("Expected empty output for nil pointer, got: %s", string(b))
 	}
 }
+
+// A macro invocation is written as its authors write one: macro, then each,
+// then its arguments by name; a table that invokes nothing keeps its keys sorted.
+func TestMarshal_InvocationLeadsWithMacro(t *testing.T) {
+	b, err := Marshal(map[string]any{
+		"plain": map[string]any{"pos": 1, "each": 2, "amp": 3},
+		"event": []any{
+			map[string]any{"pos": 4, "macro": "Hit", "amp": 0.5},
+			"rest",
+			map[string]any{"amp": 0.5, "each": map[string]any{"pos": []any{0, 4}}, "macro": "Hit"},
+		},
+		"track": map[string]any{"vel": 0.9, "macro": "Kick4", "instr": "kick"},
+	})
+	want := `event = [{ macro = "Hit", amp = 0.5, pos = 4 }, "rest", { macro = "Hit", each = { pos = [0, 4] }, amp = 0.5 }]
+
+[plain]
+amp = 3
+each = 2
+pos = 1
+
+[track]
+macro = "Kick4"
+instr = "kick"
+vel = 0.9
+`
+	if err != nil || string(b) != want {
+		t.Fatalf("got %v:\n%s\nwant:\n%s", err, b, want)
+	}
+}
