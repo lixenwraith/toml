@@ -1356,6 +1356,32 @@ func TestAFoldSharesNothing(t *testing.T) {
 	}
 }
 
+// A run under each ends at the first element its arguments could not spell,
+// here one array for two parameters that differ, so a long array no invocation
+// expands to is read once and left as it is, inside the fold's bound.
+func TestARunEndsWhereItsArgumentsCannotSpellIt(t *testing.T) {
+	doc := parse(t, `
+[macros.Pair]
+params = { a = "int", b = "int" }
+body = { a = "${a}", b = "${b}" }
+
+[macros.Both]
+params = { l = "array" }
+body = [{ macro = "Pair", each = { a = "${l}", b = "${l}" } }]
+`)
+	var s Set
+	if err := s.Define(doc); err != nil {
+		t.Fatal(err)
+	}
+	list := make([]any, 8000)
+	for i := range list {
+		list[i] = map[string]any{"a": int64(i + 1), "b": int64(i + 2)}
+	}
+	if got, err := s.Fold(list); err != nil || !reflect.DeepEqual(got, any(list)) {
+		t.Fatalf("a fold of %d elements none expands to: %v", len(list), err)
+	}
+}
+
 // A fold is bounded by its value and the set: one that would cost more steps
 // than both allow is refused, and so is what Expand refuses, a value holding
 // [macros] or nested deeper than a result may be.

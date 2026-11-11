@@ -2177,7 +2177,10 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 	if lists.op != opTable || lists.dynamic || len(lists.fields) == 0 {
 		return pos, false
 	}
-	var each, loose uint64 // the slots each binds; the fields whose argument is free
+	// The slots each binds; the fields whose argument is still free, loose, and
+	// those of them whose argument cannot be an array, fixed. A field's slot and
+	// its argument's, -1 unless loose, go on ints.
+	var each, loose, fixed uint64
 	count, open, at, arrays := -1, 0, len(f.ints), false
 	defer func() { f.ints = f.ints[:at] }()
 	for i := range lists.fields {
@@ -2185,18 +2188,23 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 		if !ok || f.slots[in.base+j].state != free {
 			return pos, false
 		}
-		f.ints = append(f.ints, in.base+j)
 		each |= 1 << j
+		outer := -1
 		switch _, n := f.nth(&lists.fields[i].node, lf, 0); {
 		case n == isFree:
 			arg, fr := f.resolve(&lists.fields[i].node, lf)
-			k := fr.m.params[arg.slot].kind
-			loose, open, arrays = loose|1<<i, open+1, arrays || k == kindAny || k == kindArray
+			if k := fr.m.params[arg.slot].kind; k == kindAny || k == kindArray {
+				arrays = true
+			} else {
+				fixed |= 1 << i
+			}
+			outer, loose, open = fr.base+arg.slot, loose|1<<i, open+1
 		case n >= 0 && count >= 0 && n != count:
 			return pos, false
 		case n >= 0:
 			count = n
 		}
+		f.ints = append(f.ints, in.base+j, outer)
 	}
 	if !f.defaults(in, each) {
 		return pos, false
@@ -2207,25 +2215,16 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 		count = 1
 	}
 	known := count >= 0
-	// Where the run stands before any expansion and after each, to come back to
-	base, done, unset, stood := len(f.vals), 0, loose, len(f.ints)
-	f.ints = append(f.ints, pos, len(f.trail), f.blanks)
+	base, done, unset := len(f.vals), 0, loose
 	defer func() { f.vals = f.vals[:base] }()
 	for ; !known || done < count; done++ {
 		mark, blanks := len(f.trail), f.blanks
 		for i := range lists.fields {
-			f.slots[f.ints[at+i]], _ = f.nth(&lists.fields[i].node, lf, done)
+			f.slots[f.ints[at+2*i]], _ = f.nth(&lists.fields[i].node, lf, done)
 		}
 		next, ok := f.splice(&in.m.body, in, kids, pos, end)
-		if !ok && known {
-			return pos, false
-		} else if !ok || next == pos && !known {
-			f.undo(mark)
-			f.blanks = blanks
-			break
-		}
-		for i := range lists.fields {
-			if j := f.ints[at+i]; loose>>i&1 != 0 {
+		for i := 0; i < len(lists.fields) && ok; i++ {
+			if j := f.ints[at+2*i]; loose>>i&1 != 0 {
 				v := f.slots[j].val
 				switch f.slots[j].state {
 				case free:
@@ -2238,24 +2237,49 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 				f.vals = append(f.vals, v)
 			}
 		}
+		// A run ends before an expansion its arguments could not spell: one that
+		// gives an argument which is no array a second value, or one argument two
+		ok = ok && f.spells(lists, loose&^unset, fixed, f.ints[at:], f.vals[base:], done, open)
+		if !ok && known {
+			return pos, false
+		} else if !ok || next == pos && !known {
+			f.vals = f.vals[:base+done*open]
+			f.undo(mark)
+			f.blanks = blanks
+			break
+		}
 		pos = next
-		f.ints = append(f.ints, pos, len(f.trail), f.blanks)
 	}
 	if !known {
 		f.eager += done
 	}
-	// A run goes as far as its arguments can spell: one that took an element
-	// too many gives it back, and the one before, until they can
-	for ; ; done-- {
-		if f.gather(lists, lf, loose, unset, f.vals[base:base+done*open], done, known) {
-			return pos, true
-		} else if known || done == 0 {
-			return pos, false
+	return pos, f.gather(lists, lf, loose, unset, f.vals[base:], done, known)
+}
+
+// spells reports the values the latest expansion of an each took can stand
+// with those before: set are the loose fields an expansion has read, their
+// arguments' slots at ints[2*i+1], and vals holds open values an expansion
+func (f *folder) spells(lists *node, set, fixed uint64, ints []int, vals []any, done, open int) bool {
+	c := 0
+	for i := range lists.fields {
+		if ints[2*i+1] < 0 {
+			continue
 		}
-		back := f.ints[stood+3*(done-1):]
-		f.undo(back[1])
-		pos, f.blanks = back[0], back[2]
+		v := vals[done*open+c]
+		if set>>i&1 != 0 && fixed>>i&1 != 0 && done > 0 && !f.equal(vals[c], v) {
+			return false
+		}
+		for j, d := 0, 0; j < i && set>>i&1 != 0; j++ {
+			if ints[2*j+1] == ints[2*i+1] && set>>j&1 != 0 && !f.equal(vals[done*open+d], v) {
+				return false
+			}
+			if ints[2*j+1] >= 0 {
+				d++
+			}
+		}
+		c++
 	}
+	return true
 }
 
 const (
