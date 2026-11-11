@@ -1200,6 +1200,7 @@ type part struct {
 	lent  bool // an array of values an each took, the fold's own until a fit keeps it
 	run   bool // an element that folds into a run with its neighbours
 	zero  bool // a value a key may leave out: an empty array, a table of nothing else
+	flat  bool // holds no table and no array, but those a key may leave out
 	keys  []string
 	kids  []any
 	cost  int   // the values it is written in once folded, a zero under a key none
@@ -1477,9 +1478,12 @@ func (f *folder) fold(x any, d int) {
 	}
 	// A key holding a zero costs nothing, there or not, so a value costs the same
 	// in every shape the fold calls the same, and folds the same from each
-	p.fit, p.runs, p.run, p.cost, p.zero = nil, p.runs[:0], false, 1, p.table || len(p.kids) == 0
+	p.fit, p.runs, p.run, p.cost, p.zero, p.flat = nil, p.runs[:0], false, 1, p.table || len(p.kids) == 0, true
 	keys := uint64(0)
 	for i, k := range p.kids {
+		if q, ok := k.(*part); ok && !q.zero {
+			p.flat = false
+		}
 		if !p.table {
 			p.cost += cost(k)
 		} else if keys |= bit(p.keys[i]); !f.zero(k) {
@@ -1511,7 +1515,7 @@ func (f *folder) table(p *part, keys uint64, d int) {
 		}
 		root := f.enter(f.tables[i].m)
 		if f.match(&root.m.body, root, p, true) {
-			f.found(root, p.cost, 0)
+			f.found(root, p.cost, 0, p.flat)
 		}
 		f.leave(root)
 	}
@@ -1542,11 +1546,12 @@ func (f *folder) array(p *part, d int) {
 			root := f.enter(f.splices[i])
 			f.eager = 0
 			if to, ok := f.splice(&root.m.body, root, p.kids, pos, len(p.kids)); ok && to > pos {
-				most := 0
+				most, flat := 0, true
 				for _, k := range p.kids[pos:to] {
-					most += cost(k)
+					q, ok := k.(*part)
+					most, flat = most+cost(k), flat && (!ok || q.flat)
 				}
-				f.found(root, most, to)
+				f.found(root, most, to, flat)
 			}
 			f.leave(root)
 			f.next[i] = pos + f.eager
@@ -1567,7 +1572,7 @@ func (f *folder) array(p *part, d int) {
 // found notes the macro whose body just matched, unless its invocation would
 // write more than the most values it replaces: its arguments, one equal to its
 // default left out, and one nothing settled given its type's zero value
-func (f *folder) found(fr frame, most, to int) {
+func (f *folder) found(fr frame, most, to int, flat bool) {
 	m, at, blanks := fr.m, len(f.args), f.blanks
 	c := fit{m: m, cost: 2, to: to}
 	for i := range m.params {
@@ -1585,7 +1590,11 @@ func (f *folder) found(fr frame, most, to int) {
 	}
 	// What the invocation replaces is the table as its macro writes it, the
 	// zeros a struct leaves out among them, so that an entry the author wrote
-	// as an invocation stays one from a struct's shape
+	// as an invocation stays one from a struct's shape. A table of scalars is
+	// what it holds: a note is not written longer for the zeros its macro spells.
+	if flat {
+		blanks = 0
+	}
 	if c.save = most - c.cost; c.save+blanks < 0 {
 		f.args = f.args[:at]
 		return

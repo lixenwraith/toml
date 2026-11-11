@@ -92,6 +92,7 @@ doc, err := toml.ParseDocument(data)
 err = doc.Decode(&settings)
 unknown := doc.Unmapped(&settings)         // []toml.Key no field takes
 removed, err := doc.Delete(toml.Key{"play", "effects"})
+own := doc.Comments(toml.Key{"pattern"})   // the comments above each [[pattern]]
 err = doc.Set(toml.Key{"play", "sfx"}, false)
 added, err := doc.Fill(shipped)             // keys a newer template sets, with their comments
 data = doc.Bytes()
@@ -124,6 +125,18 @@ split at the widest gap.
   comments. A run of statements going whole takes the comments that belong to
   it and one blank run beside it. It reports whether it removed anything; a key
   inside an inline value fails.
+- `Comments` gives what `Delete` takes from above each `[[key]]` header of an
+  array of tables, one element a header in the document's order, so element i
+  is table i of the array in `Tree`: the comment lines that are that table's
+  own, as written, each run of blank lines among or under them cut to one. A
+  table with none gives nil, as does a key that is not an array of tables
+  written with headers. A caller that deletes the array and writes its tables
+  anew puts each element under one blank line and above its table's header:
+  the comments are that table's again, a tie going below, and doing it twice
+  changes no byte. A comment inside a table (above a key or a sub-table's
+  header, under its last key, at a line's end) is not returned and is lost; one
+  that ends what is left of the document, a blank line above it, becomes the
+  first table's.
 - `Fill` adds each key another document sets that this one does not, as that
   one writes it with the comments that are its own there, and names them: a
   newer template's keys reach a file a person edited, every line of the file
@@ -358,11 +371,12 @@ folded, err := set.Fold(value) // expands to value again
   macros it invokes and any base. `each` reads backwards: an argument comes
   back as one value where every expansion agrees and the parameter takes one,
   and as an array where they differ or the parameter is an `array`.
-- **Which.** The fewest values written, a table, an array and a scalar each
-  one: a macro over a base before its base, and a table left a table where its
-  own folded parts write fewer than an invocation of the whole. An invocation
-  that writes as many as the table it replaces stands. Then the fewest
-  arguments, then the first name, so one value always folds one way.
+- **Which.** The fewest values written, counted as below, a table, an array
+  and a scalar each one: a macro over a base before its base, and a table left
+  a table where its own folded parts write fewer than an invocation of the
+  whole. An invocation that writes as many as the table it replaces stands.
+  Then the fewest arguments, then the first name, so one value always folds
+  one way.
 - **Defaults.** An argument equal to its parameter's default is left out.
 - **The same value.** A fold's expansion is its value again under one rule,
   made for what `Marshal` writes of a Go struct, where a field at its zero
@@ -375,8 +389,10 @@ folded, err := set.Fold(value) // expands to value again
   It is never read the other way: a fold drops no key its value holds. In
   counting, a key holding a zero costs nothing in the value, there or not, and
   what it writes in a body, so a struct's shape folds to the invocations its
-  expansion does. A zero left out of an `any` parameter is written `0`, unless
-  a value that is there says which zero it is.
+  expansion does, one that spells such a zero included. A table that holds no
+  table and no array, or a run of such tables, costs only what it holds, so
+  none is written as an invocation of more values. A zero left out of an `any`
+  parameter is written `0`, unless a value that is there says which zero it is.
 - **Checked.** What a fold writes, the expander itself expands, and the result
   is compared with the value under that rule before `Fold` returns. An
   invocation that does not come back is dropped and its part left as it was.

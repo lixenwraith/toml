@@ -1166,6 +1166,69 @@ event = [{ macro = "Chord", pos = 2, deg = [1, 3, 5], vel = 0.9 }, { macro = "Ch
 `)
 }
 
+const lanes = `
+[macros.Hit]
+params = { pos = "int", vel = "float", prob = "float" }
+defaults = { prob = 0 }
+body = { pos = "${pos}", vel = "${vel}", prob = "${prob}" }
+
+[macros.Drum]
+params = { instr = "string", pos = "array", vel = "any", humanize = "float", prob = "float" }
+defaults = { humanize = 0.4, prob = 0 }
+body = { instr = "${instr}", humanize = "${humanize}", event = [
+  { macro = "Hit", each = { pos = "${pos}", vel = "${vel}" }, prob = "${prob}" },
+] }
+
+[macros.Note]
+params = { pos = "int", deg = "int", dur = "int", vel = "float", oct = "int" }
+defaults = { deg = 0, dur = 1, vel = 0.5, oct = 2 }
+body = { pos = "${pos}", deg = "${deg}", dur = "${dur}", vel = "${vel}", oct = "${oct}" }
+
+[macros.Chord]
+params = { pos = "int", deg = "array", dur = "int", vel = "float", oct = "int" }
+defaults = { dur = 1, vel = 0.4, oct = 2 }
+body = [{ macro = "Note", each = { deg = "${deg}" }, pos = "${pos}", dur = "${dur}", vel = "${vel}", oct = "${oct}" }]
+`
+
+// A table that holds no table and no array, and a run of such tables, folds
+// only to an invocation of no more values than it holds: the zeros its macro
+// would spell do not count for it, so a note an edit parted from its lane stays
+// a table. A lane, which holds its notes, is still written as its author's
+// invocation, a value longer for the zero it spells.
+func TestATableOfScalarsFoldsOnlyToAnInvocationNoLonger(t *testing.T) {
+	const kept = `
+[[track]]
+instr = "kick"
+event = [{ pos = 0, vel = 1.0 }, { pos = 4, vel = 1.0, prob = 0.5 }, { pos = 8, vel = 1.0 }, { pos = 12, vel = 1.0 }]
+[[track]]
+instr = "bass"
+follow_chord = true
+humanize = 0.12
+event = [{ pos = 1, vel = 0.85, dur = 1 }, { pos = 2, vel = 0.7, dur = 1 }, { pos = 3, vel = 0.7, dur = 1, bend = 2.0 }]
+[[track]]
+instr = "pad"
+event = [{ pos = 0, vel = 0.4, dur = 2, oct = 2 }]
+`
+	folds(t, lanes+kept+`
+[[track]]
+instr = "kick"
+event = [{ pos = 4, vel = 1.0 }]
+[note]
+shorter = { pos = 6, vel = 0.65, deg = 4, dur = 1, oct = 2 }
+as_long = { pos = 10, vel = 0.6, deg = 7, dur = 1, oct = 1 }
+`, kept+`
+[[track]]
+macro = "Drum"
+instr = "kick"
+pos = [4]
+vel = 1.0
+humanize = 0.0
+[note]
+shorter = { macro = "Note", pos = 6, vel = 0.65, deg = 4 }
+as_long = { macro = "Note", pos = 10, vel = 0.6, deg = 7, oct = 1 }
+`)
+}
+
 // Among the invocations that expand to a table, the one writing the fewest
 // values stands, so a macro over a base before its base; then the fewest
 // arguments; then the first name.
