@@ -81,6 +81,10 @@ func entries(v reflect.Value) ([]entry, error) {
 		return nil, fmt.Errorf("expected struct or map, got %s", v.Kind())
 	}
 	slices.SortFunc(out, func(a, b entry) int { return cmp.Compare(a.name, b.name) })
+	// A macro invocation is read from its macro, then its each, as it is written
+	if _, ok := slices.BinarySearchFunc(out, "macro", func(x entry, k string) int { return cmp.Compare(x.name, k) }); ok {
+		slices.SortStableFunc(out, func(a, b entry) int { return lead(a.name) - lead(b.name) })
+	}
 	result := out[:0]
 	previous := ""
 	for i, x := range out {
@@ -99,6 +103,17 @@ func entries(v reflect.Value) ([]entry, error) {
 		}
 	}
 	return result, nil
+}
+
+// lead ranks the keys of the macro package that an invocation opens with
+func lead(key string) int {
+	switch key {
+	case "macro":
+		return 0
+	case "each":
+		return 1
+	}
+	return 2
 }
 
 // Every header repeats its table's full path, so deep nesting under headers

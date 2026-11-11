@@ -56,7 +56,8 @@ checks also work on 32-bit systems.
 ## Encoding and round trips
 
 `Marshal` accepts a struct or string-keyed map, including pointers to them. Keys
-are sorted. Scalar fields precede nested tables. Table path segments are quoted
+are sorted, but a table holding `macro`, a macro invocation, opens with it and
+then with `each`, as one is written. Scalar fields precede nested tables. Table path segments are quoted
 individually, preserving dots, spaces, quotes and Unicode in keys. Mixed arrays
 and nested table values use inline tables when needed. Struct `omitempty` is
 honored; nil pointer/interface fields are omitted. Nil pointer/interface array
