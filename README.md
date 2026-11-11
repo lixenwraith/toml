@@ -371,11 +371,12 @@ folded, err := set.Fold(value) // expands to value again
   macros it invokes and any base. `each` reads backwards: an argument comes
   back as one value where every expansion agrees and the parameter takes one,
   and as an array where they differ or the parameter is an `array`.
-- **Which.** The fewest values written, a table, an array and a scalar each
-  one: a macro over a base before its base, and a table left a table where its
-  own folded parts write fewer than an invocation of the whole. An invocation
-  that writes as many as the table it replaces stands. Then the fewest
-  arguments, then the first name, so one value always folds one way.
+- **Which.** The fewest values written, counted as below, a table, an array
+  and a scalar each one: a macro over a base before its base, and a table left
+  a table where its own folded parts write fewer than an invocation of the
+  whole. An invocation that writes as many as the table it replaces stands.
+  Then the fewest arguments, then the first name, so one value always folds
+  one way.
 - **Defaults.** An argument equal to its parameter's default is left out.
 - **The same value.** A fold's expansion is its value again under one rule,
   made for what `Marshal` writes of a Go struct, where a field at its zero
@@ -388,8 +389,10 @@ folded, err := set.Fold(value) // expands to value again
   It is never read the other way: a fold drops no key its value holds. In
   counting, a key holding a zero costs nothing in the value, there or not, and
   what it writes in a body, so a struct's shape folds to the invocations its
-  expansion does. A zero left out of an `any` parameter is written `0`, unless
-  a value that is there says which zero it is.
+  expansion does, one that spells such a zero included. A table that holds no
+  table and no array, or a run of such tables, costs only what it holds, so
+  none is written as an invocation of more values. A zero left out of an `any`
+  parameter is written `0`, unless a value that is there says which zero it is.
 - **Checked.** What a fold writes, the expander itself expands, and the result
   is compared with the value under that rule before `Fold` returns. An
   invocation that does not come back is dropped and its part left as it was.
