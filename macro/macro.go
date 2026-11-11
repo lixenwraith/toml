@@ -1230,8 +1230,13 @@ type shape struct {
 	keys uint64
 }
 
-// left stands for an argument an invocation leaves to its default
-var left = new(part)
+// left stands for an argument an invocation leaves to its default, and unknown
+// for a zero an each took of an any parameter: written 0, unless a value that
+// is there says which zero it is
+var (
+	left    = new(part)
+	unknown = &part{cost: 1, zero: true}
+)
 
 // slot is a parameter while a body is matched: free until a value is found for
 // it, bound to one of the input's, blank where all that is known of an any
@@ -1677,6 +1682,8 @@ func (f *folder) write(x any) any {
 	switch {
 	case !ok:
 		return x
+	case p == unknown:
+		return int64(0)
 	case p.fit != nil:
 		return f.invocation(p.fit)
 	case p.table:
@@ -2171,7 +2178,7 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 		return pos, false
 	}
 	var each, loose uint64 // the slots each binds; the fields whose argument is free
-	count, open, at := -1, 0, len(f.ints)
+	count, open, at, arrays := -1, 0, len(f.ints), false
 	defer func() { f.ints = f.ints[:at] }()
 	for i := range lists.fields {
 		j, ok := in.m.slot(lists.fields[i].key)
@@ -2182,7 +2189,9 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 		each |= 1 << j
 		switch _, n := f.nth(&lists.fields[i].node, lf, 0); {
 		case n == isFree:
-			loose, open = loose|1<<i, open+1
+			arg, fr := f.resolve(&lists.fields[i].node, lf)
+			k := fr.m.params[arg.slot].kind
+			loose, open, arrays = loose|1<<i, open+1, arrays || k == kindAny || k == kindArray
 		case n >= 0 && count >= 0 && n != count:
 			return pos, false
 		case n >= 0:
@@ -2192,10 +2201,12 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 	if !f.defaults(in, each) {
 		return pos, false
 	}
-	known := count >= 0 || open == 0
-	if count < 0 && open == 0 {
-		count = 1 // with no array in it, each expands once
+	// With no array in it, each expands once; so it does where none of its
+	// arguments still free can be one
+	if count < 0 && !arrays {
+		count = 1
 	}
+	known := count >= 0
 	// Where the run stands before any expansion and after each, to come back to
 	base, done, unset, stood := len(f.vals), 0, loose, len(f.ints)
 	f.ints = append(f.ints, pos, len(f.trail), f.blanks)
@@ -2216,9 +2227,12 @@ func (f *folder) each(n *node, fr frame, kids []any, pos, end int) (int, bool) {
 		for i := range lists.fields {
 			if j := f.ints[at+i]; loose>>i&1 != 0 {
 				v := f.slots[j].val
-				if f.slots[j].state == free {
+				switch f.slots[j].state {
+				case free:
 					v = zero(in.m.params[j-in.base].kind)
-				} else {
+				case blank:
+					v, unset = unknown, unset&^(1<<i)
+				default:
 					unset &^= 1 << i
 				}
 				f.vals = append(f.vals, v)
@@ -2290,11 +2304,14 @@ func (f *folder) nth(n *node, fr frame, i int) (slot, int) {
 // gather binds the arguments an each left free to the values its expansions
 // took, done of them for each loose field in turn: one value where they all
 // agree and the parameter takes one, else their array; a field in unset, which
-// the body never read, stays free. Where no array is left to count the
+// no expansion settled, stays free. Where no array is left to count the
 // expansions by, the first argument that can be one is.
 func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, done int, known bool) bool {
-	open := bits.OnesCount64(loose)
-	var shared uint64
+	open, counted := bits.OnesCount64(loose), known || done == 1
+	if f.steps += done; !f.step() {
+		return false
+	}
+	var arrays uint64 // the loose fields, in their order, whose values stay an array
 	for pass := range 2 {
 		c := 0
 		for i := range lists.fields {
@@ -2303,25 +2320,21 @@ func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, 
 			}
 			n, fr := f.resolve(&lists.fields[i].node, lf)
 			k := fr.m.params[n.slot].kind
-			switch one := shared>>c&1 != 0; {
+			switch {
 			case pass == 0:
-				agree := true
+				agree := done > 0
 				for j := 1; j < done && agree; j++ {
 					agree = f.equal(vals[c], vals[j*open+c])
 				}
-				if a, isPart := any(nil), false; agree && done > 0 {
-					a, isPart = vals[c].(*part)
-					_, agree = take(k, vals[c])
-					agree = agree && !(isPart && !a.(*part).table)
-				}
 				if agree {
-					shared |= 1 << c
+					a, _ := vals[c].(*part)
+					_, agree = take(k, vals[c])
+					agree = agree && (a == nil || a.table) || a == unknown && k != kindArray
 				}
-			case one && done > 0 && unset>>i&1 == 0:
-				if !f.arg(fr, n.slot, vals[c], true) {
-					return false
+				if !agree && done > 0 && unset>>i&1 == 0 {
+					arrays, counted = arrays|1<<c, true
 				}
-			case !one:
+			case !counted && (k == kindAny || k == kindArray), arrays>>c&1 != 0:
 				at := len(f.elems)
 				f.elems = append(f.elems, make([]any, done)...)
 				f.lists = append(f.lists, part{kids: f.elems[at:len(f.elems):len(f.elems)], cost: 1, lent: true, zero: done == 0})
@@ -2330,31 +2343,23 @@ func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, 
 					list.kids[j] = vals[j*open+c]
 					list.cost += cost(list.kids[j])
 				}
-				if !f.arg(fr, n.slot, list, true) {
+				if counted = true; !f.arg(fr, n.slot, list, true) {
+					return false
+				}
+			case done > 0 && unset>>i&1 == 0:
+				// The value they agree on is the first that says what it is
+				v := any(unknown)
+				for j := 0; j < done && v == any(unknown); j++ {
+					v = vals[j*open+c]
+				}
+				if !f.arg(fr, n.slot, v, v != any(unknown)) {
 					return false
 				}
 			}
 			c++
 		}
-		if pass == 0 && !known && done != 1 && shared == 1<<open-1 {
-			c = 0
-			for i := range lists.fields {
-				if loose>>i&1 == 0 {
-					continue
-				}
-				n, fr := f.resolve(&lists.fields[i].node, lf)
-				if k := fr.m.params[n.slot].kind; k == kindAny || k == kindArray {
-					shared &^= 1 << c
-					break
-				}
-				c++
-			}
-			if shared == 1<<open-1 {
-				return false
-			}
-		}
 	}
-	return true
+	return counted
 }
 
 // same reports v, a value of the set or of an expansion, is x under the fold's
@@ -2368,6 +2373,8 @@ func (f *folder) same(v, x any) bool {
 	table, _ := v.(map[string]any)
 	list, isList := v.([]any)
 	switch {
+	case p == unknown:
+		return f.blank(v)
 	case table == nil && !isList:
 		return p == nil && sameScalar(v, x)
 	case p == nil || p.table == isList || isList && len(list) != len(p.kids):
@@ -2414,6 +2421,8 @@ func (f *folder) equal(a, b any) bool {
 	p, _ := a.(*part)
 	q, _ := b.(*part)
 	switch {
+	case p == unknown || q == unknown:
+		return f.zero(a) && f.zero(b)
 	case p == nil || q == nil:
 		return p == nil && q == nil && sameScalar(a, b)
 	case p.table != q.table || !p.table && len(p.kids) != len(q.kids):
@@ -2422,6 +2431,8 @@ func (f *folder) equal(a, b any) bool {
 		for i := range p.kids {
 			if !f.equal(p.kids[i], q.kids[i]) {
 				return false
+			} else if p.kids[i] == any(unknown) {
+				p.kids[i] = q.kids[i]
 			}
 		}
 		return true
