@@ -339,6 +339,61 @@ document writes it, and `with` for `body` in a macro over a base. What it quotes
 of a document is cut to 32 bytes and a path to 64 steps, so an error stays small
 whatever the document.
 
+`Fold` is the inverse of `Expand`: given an expanded value, a whole document or
+a part of one, it returns the value with every part that an invocation of one of
+the set's macros expands to replaced by that invocation, a table holding `macro`
+and its arguments. What no macro expands to stays as it is, which is never an
+error.
+
+```go
+value, err := set.Expand(doc)
+folded, err := set.Fold(value) // expands to value again
+```
+
+- **Where it looks.** At every level: each table, and each run of an array's
+  elements. A run that a macro whose body is an array expands to becomes one
+  element; an array is never an invocation as a whole.
+- **Through bodies.** A body is matched as what it expands to, through the
+  macros it invokes and any base. `each` reads backwards: an argument comes
+  back as one value where every expansion agrees and the parameter takes one,
+  and as an array where they differ or the parameter is an `array`.
+- **Which.** The fewest values written, a table, an array and a scalar each
+  one: a macro over a base before its base, and a table left a table where its
+  own folded parts write fewer than an invocation of the whole. An invocation
+  that writes as many as the table it replaces stands. Then the fewest
+  arguments, then the first name, so one value always folds one way.
+- **Defaults.** An argument equal to its parameter's default is left out.
+- **The same value.** A fold's expansion is its value again under one rule,
+  made for what `Marshal` writes of a Go struct, where a field at its zero
+  value is absent and a float field writes `1.0` where a body wrote `1`:
+  - the expansion may hold a key the value leaves out, where it holds a zero
+    value: `0`, `0.0`, `false`, `""`, an empty array, or a table of nothing
+    else;
+  - an integer and the float of exactly its value are one number.
+
+  It is never read the other way: a fold drops no key its value holds. In
+  counting, a key holding a zero costs nothing in the value, there or not, and
+  what it writes in a body, so a value folds the same from a struct's shape as
+  from its expansion.
+- **Checked.** What a fold writes, the expander itself expands, and the result
+  is compared with the value under that rule before `Fold` returns. An
+  invocation that does not come back is dropped and its part left as it was.
+- **A fixed point.** Folding a fold's expansion gives the fold again.
+- **Left alone.** A body that invokes by a name spelled from arguments
+  (`"${theme}Fg"`); text around more than one reference still unknown, whose
+  split nothing settles; an `each` written as one reference; a table holding
+  nothing but zero values; and macros the set does not hold. A run of single
+  elements is not gathered into one invocation with `each`: only a body's own
+  `each` is read back.
+
+`Fold` does not modify its value, and its result shares no table or array with
+the value or the set; arrays come back as `[]any`. It spends none of the set's
+budget, and what it writes expands within `Set.MaxValues` through a set that
+has spent nothing. It refuses what `Expand` refuses, a value holding `[macros]`
+or nested deeper than 1000 levels, and it is bounded: a fold takes at most 64
+steps, a value read, compared or written, for each value of its input times
+each value the set's macros hold, and passing that is an error.
+
 ## Deliberate subset and deviations
 
 - Datetime syntax is unsupported. Use quoted strings and parse them in the

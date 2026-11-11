@@ -975,6 +975,451 @@ func FuzzExpandDocument(f *testing.F) {
 	})
 }
 
+// asStruct is v as a Go struct marshals it, written apart from the fold: no key
+// holding a zero value, and a whole float as its integer
+func asStruct(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for k, x := range v {
+			if x = asStruct(x); !zeroValue(x) {
+				out[k] = x
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, x := range v {
+			out[i] = asStruct(x)
+		}
+		return out
+	case float64:
+		if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
+			return int64(v)
+		}
+	}
+	return v
+}
+
+func zeroValue(v any) bool {
+	switch v := v.(type) {
+	case map[string]any:
+		return len(asStruct(v).(map[string]any)) == 0
+	case []any:
+		return len(v) == 0
+	}
+	return v == int64(0) || v == 0.0 || v == "" || v == false
+}
+
+// covers is the fold's rule, written apart from it: back holds every key of v
+// with the same value, a key v leaves out holds a zero value, and an integer is
+// the float of its value
+func covers(back, v any) bool {
+	switch v := v.(type) {
+	case map[string]any:
+		b, ok := back.(map[string]any)
+		for k, x := range v {
+			if y, held := b[k]; !held || !covers(y, x) {
+				return false
+			}
+		}
+		for k, y := range b {
+			if _, held := v[k]; !held && !zeroValue(y) {
+				return false
+			}
+		}
+		return ok
+	case []any:
+		b, ok := back.([]any)
+		if !ok || len(b) != len(v) {
+			return false
+		}
+		for i := range v {
+			if !covers(b[i], v[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(asStruct(back), asStruct(v))
+}
+
+// folds defines src's macros, folds what the rest of it expands to and wants
+// the document want; as of every fold, it must expand to its value again and
+// be the fold of that expansion
+func folds(t *testing.T, src, want string) {
+	t.Helper()
+	doc := parse(t, src)
+	var s Set
+	if err := s.Define(doc); err != nil {
+		t.Fatal(err)
+	}
+	value, err := s.Expand(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Fold(value)
+	if w := normalize(parse(t, want)); err != nil || !reflect.DeepEqual(got, w) {
+		t.Fatalf("fold\n got %v (%v)\nwant %v", got, err, w)
+	}
+	s.spent = 0
+	back, err := s.Expand(got.(map[string]any))
+	if err != nil || !covers(back, value) {
+		t.Fatalf("the fold expands to %v (%v), not %v", back, err, value)
+	}
+	if again, err := s.Fold(back); err != nil || !reflect.DeepEqual(again, got) {
+		t.Fatalf("the fold of the fold's expansion is %v (%v), not %v", again, err, got)
+	}
+}
+
+// A table a macro expands to becomes its invocation, at every level, and one
+// none expands to stays as it is.
+func TestATableAMacroExpandsToFoldsToItsInvocation(t *testing.T) {
+	folds(t, `
+[macros.Hit]
+params = { pos = "int", vel = "float" }
+body = { kind = "hit", loud = true, pos = "${pos}", vel = "${vel}" }
+
+[song]
+name = "a"
+intro = { kind = "hit", loud = true, pos = 8, vel = 0.5 }
+[[song.track]]
+event = [{ kind = "hit", loud = true, pos = 4, vel = 1.0 }, { kind = "miss", loud = true, pos = 4, vel = 1.0 }]
+`, `
+[song]
+name = "a"
+intro = { macro = "Hit", pos = 8, vel = 0.5 }
+[[song.track]]
+event = [{ macro = "Hit", pos = 4, vel = 1.0 }, { kind = "miss", loud = true, pos = 4, vel = 1.0 }]
+`)
+}
+
+const chords = `
+[macros.Note]
+params = { pos = "int", deg = "int", vel = "float" }
+defaults = { vel = 0.5 }
+body = { pos = "${pos}", deg = "${deg}", vel = "${vel}" }
+
+[macros.Chord]
+params = { pos = "int", deg = "array", vel = "float" }
+defaults = { vel = 0.5 }
+body = [{ macro = "Note", each = { deg = "${deg}" }, pos = "${pos}", vel = "${vel}" }]
+
+[macros.Line]
+params = { instr = "string", pos = "array", deg = "any", vel = "any" }
+defaults = { vel = 0.5 }
+body = { instr = "${instr}", event = [{ macro = "Note", each = { pos = "${pos}", deg = "${deg}", vel = "${vel}" } }] }
+`
+
+// A run of an array's elements that one invocation expands to, its body an
+// array, becomes that one element; the elements around it stay.
+func TestARunOfElementsFoldsToOneInvocation(t *testing.T) {
+	folds(t, chords+`
+[doc]
+event = ["rest", { pos = 2, deg = 1, vel = 0.9 }, { pos = 2, deg = 3, vel = 0.9 }, { pos = 2, deg = 5, vel = 0.9 }, { pos = 6, deg = 1, vel = 0.9 }]
+`, `
+[doc]
+event = ["rest", { macro = "Chord", pos = 2, deg = [1, 3, 5], vel = 0.9 }, { pos = 6, deg = 1, vel = 0.9 }]
+`)
+}
+
+// A body that invokes with each is matched as what it expands to: an argument
+// comes back as one value where every element agrees and the parameter takes
+// one, and as an array where they differ or the parameter is an array.
+func TestEachIsReadBackwards(t *testing.T) {
+	folds(t, chords+`
+[[track]]
+instr = "bass"
+event = [{ pos = 0, deg = 7, vel = 0.9 }, { pos = 4, deg = 7, vel = 0.6 }]
+[[track]]
+instr = "lead"
+event = [{ pos = 2, deg = 1, vel = 0.5 }, { pos = 2, deg = 3, vel = 0.5 }]
+`, `
+[[track]]
+macro = "Line"
+instr = "bass"
+pos = [0, 4]
+deg = 7
+vel = [0.9, 0.6]
+[[track]]
+macro = "Line"
+instr = "lead"
+pos = [2, 2]
+deg = [1, 3]
+`)
+}
+
+// A table stays a table where its folded parts write fewer values than the
+// invocation of a macro that expands to the whole of it.
+func TestATableStaysWhereItsFoldedPartsWriteFewer(t *testing.T) {
+	folds(t, chords+`
+[[track]]
+instr = "piano"
+event = [
+  { pos = 2, deg = 1, vel = 0.9 }, { pos = 2, deg = 3, vel = 0.9 }, { pos = 2, deg = 5, vel = 0.9 },
+  { pos = 6, deg = 1, vel = 0.7 }, { pos = 6, deg = 3, vel = 0.7 }, { pos = 6, deg = 5, vel = 0.7 },
+]
+`, `
+[[track]]
+instr = "piano"
+event = [{ macro = "Chord", pos = 2, deg = [1, 3, 5], vel = 0.9 }, { macro = "Chord", pos = 6, deg = [1, 3, 5], vel = 0.7 }]
+`)
+}
+
+// Among the invocations that expand to a table, the one writing the fewest
+// values stands, so a macro over a base before its base; then the fewest
+// arguments; then the first name.
+func TestTheFewestValuesThenArgumentsThenTheNameDecide(t *testing.T) {
+	folds(t, `
+[macros.Drum]
+params = { instr = "string", vel = "float" }
+body = { instr = "${instr}", vel = "${vel}" }
+
+[macros.Kick]
+base = "Drum"
+with = { instr = "kick" }
+
+[macros.Thud]
+base = "Drum"
+with = { instr = "kick" }
+
+[macros.Pair]
+params = { k = "int", j = "int", spare = "int" }
+body = { kind = "x", n = 1, inner = { k = "${k}", j = "${j}" } }
+
+[macros.Wrap]
+params = { t = "table" }
+body = { kind = "x", n = 1, inner = "${t}" }
+
+[doc]
+values = { instr = "kick", vel = 0.8 }
+arguments = { kind = "x", n = 1, inner = { k = 1, j = 2 } }
+`, `
+[doc]
+values = { macro = "Kick", vel = 0.8 }
+arguments = { macro = "Wrap", t = { k = 1, j = 2 } }
+`)
+}
+
+// An argument equal to its parameter's default is left out.
+func TestAnArgumentEqualToItsDefaultIsLeftOut(t *testing.T) {
+	folds(t, `
+[macros.Pad]
+params = { pos = "array", vel = "float", mode = "table" }
+defaults = { vel = 1, mode = { soft = true } }
+body = { instr = "pad", pos = "${pos}", vel = "${vel}", mode = "${mode}" }
+
+[doc]
+a = { instr = "pad", pos = [0, 16], vel = 1.0, mode = { soft = true } }
+b = { instr = "pad", pos = [0], vel = 0.3, mode = { soft = true } }
+`, `
+[doc]
+a = { macro = "Pad", pos = [0, 16] }
+b = { macro = "Pad", pos = [0], vel = 0.3 }
+`)
+}
+
+// A value is the same where the expansion holds a key it leaves out, holding a
+// zero value, or an integer for the float of its value: what a Go struct
+// marshals to folds as its expansion does. A key the value holds is never
+// dropped, zero or not.
+func TestAValueFoldsFromAStructsShape(t *testing.T) {
+	folds(t, `
+[macros.Hit]
+params = { pos = "int", vel = "float", prob = "float" }
+defaults = { vel = 1, prob = 0 }
+body = { kind = "hit", mute = false, pos = "${pos}", vel = "${vel}", prob = "${prob}", fx = { wet = 0, on = [] } }
+
+[doc]
+event = [{ kind = "hit", vel = 1.0 }, { kind = "hit", pos = 4, vel = 0.5 }, { kind = "hit", pos = 4, vel = 0.5, pan = 0 }]
+`, `
+[doc]
+event = [{ macro = "Hit", pos = 0 }, { macro = "Hit", pos = 4, vel = 0.5 }, { kind = "hit", pos = 4, vel = 0.5, pan = 0 }]
+`)
+}
+
+// A fold is checked before it stands: an invocation the expander does not
+// expand to what it replaces is dropped and the part left as it was.
+func TestAnInvocationThatDoesNotExpandBackIsDropped(t *testing.T) {
+	folds(t, `
+[macros.Inner]
+params = { n = "int" }
+body = { kind = "x", n = "${n}" }
+
+[macros.Outer]
+doc = "matches a table holding n = \"seven\", and can never expand: n wants an int"
+body = { macro = "Inner", n = "seven" }
+
+[doc]
+v = { kind = "x", n = "seven" }
+w = { kind = "x", n = 7 }
+`, `
+[doc]
+v = { kind = "x", n = "seven" }
+w = { macro = "Inner", n = 7 }
+`)
+}
+
+// Left alone: a body that invokes by a name spelled from arguments, text around
+// more than one reference, and an each written as one reference.
+func TestWhatAFoldLeavesAlone(t *testing.T) {
+	folds(t, `
+[macros.RedFg]
+body = { color = 1, bold = true }
+
+[macros.Theme]
+params = { theme = "string" }
+body = { on = true, fg = { macro = "${theme}Fg" } }
+
+[macros.Tag]
+params = { a = "string", b = "string" }
+body = { kind = "tag", id = "${a}-${b}" }
+
+[macros.Cell]
+params = { x = "int" }
+body = { kind = "cell", x = "${x}" }
+
+[macros.Row]
+params = { lists = "table" }
+body = { kind = "row", cells = [{ macro = "Cell", each = "${lists}" }] }
+
+[doc]
+name = { on = true, fg = { color = 1, bold = true } }
+text = { kind = "tag", id = "x-y" }
+each = { kind = "row", cells = [{ kind = "cell", x = 1 }, { kind = "cell", x = 2 }] }
+`, `
+[doc]
+name = { on = true, fg = { macro = "RedFg" } }
+text = { kind = "tag", id = "x-y" }
+each = { kind = "row", cells = [{ macro = "Cell", x = 1 }, { macro = "Cell", x = 2 }] }
+`)
+}
+
+// What its author wrote comes back: a bank's expansion, and that expansion in
+// a struct's shape, fold to the document's own invocations.
+func TestAFoldWritesWhatItsAuthorWrote(t *testing.T) {
+	doc := parse(t, bank(8))
+	var s Set
+	if err := s.Define(doc); err != nil {
+		t.Fatal(err)
+	}
+	value, err := s.Expand(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []any{value, asStruct(value)} {
+		if got, err := s.Fold(in); err != nil || !reflect.DeepEqual(got, normalize(doc)) {
+			t.Fatalf("fold\n got %v (%v)\nwant %v", got, err, doc)
+		}
+	}
+}
+
+// A fold leaves its value alone, and its result is its reader's own: writing
+// over it reaches neither the value nor the set.
+func TestAFoldSharesNothing(t *testing.T) {
+	doc := parse(t, bank(2))
+	var s Set
+	if err := s.Define(doc); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := s.Expand(doc)
+	kept := normalize(value)
+	got, err := s.Fold(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[uintptr]bool{}
+	hold(t, held, got)
+	hold(t, held, value)
+	scribble(got)
+	s.spent = 0
+	if again, err := s.Expand(doc); err != nil || !reflect.DeepEqual(value, kept) || !reflect.DeepEqual(again, kept) {
+		t.Fatalf("writing over a fold reached its value or the set (%v)", err)
+	}
+}
+
+// A fold is bounded by its value and the set: one that would cost more steps
+// than both allow is refused, and so is what Expand refuses, a value holding
+// [macros] or nested deeper than a result may be.
+func TestAFoldIsBounded(t *testing.T) {
+	var b strings.Builder
+	for i := range 16 {
+		fmt.Fprintf(&b, "[macros.A%d]\nbody = { x = { macro = \"A%d\" }, y = { macro = \"A%d\" } }\n", i, i+1, i+1)
+	}
+	b.WriteString("[macros.A16]\nbody = { k = 0 }\n[macros.Top]\nparams = { z = \"int\" }\nbody = { z = \"${z}\", t = { macro = \"A0\" } }\n")
+	doc := parse(t, b.String())
+	var s Set
+	if err := s.Define(doc); err != nil {
+		t.Fatal(err)
+	}
+	deep := any(int64(1))
+	for range maxNesting + 1 {
+		deep = []any{deep}
+	}
+	for want, v := range map[string]any{
+		"fold exceeds": map[string]any{"z": int64(1)},
+		"not allowed":  map[string]any{"macros": map[string]any{}},
+		"nests deeper": deep,
+	} {
+		if _, err := s.Fold(v); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("got %v, want an error containing %q", err, want)
+		}
+	}
+}
+
+// A fold never changes what a value means: whatever a document expands to, the
+// fold of it, and of it in a struct's shape, expands to it again, leaves it
+// alone, shares nothing with it and folds to itself.
+func FuzzFold(f *testing.F) {
+	f.Add("[macros.M]\nparams = { y = \"int\" }\nbody = [\"${y}\"]\n[x]\na = [{ macro = \"M\", each = { y = [1, 2] } }]\n")
+	f.Add("[macros.M]\nparams = { k = \"string\", v = \"any\" }\ndefaults = { v = 0 }\nbody = { \"p_${k}\" = \"${v}\", name = \"${k}Fg\", n = 0 }\n[[x]]\nmacro = \"M\"\nk = \"a\"\nv = [{ macro = \"M\", k = \"b\" }]\n")
+	f.Add("[macros.A]\nbase = \"B\"\nparams = { b = \"int\" }\ndefaults = { a = 1 }\nwith = { b = [\"${b}\", { macro = \"C\" }] }\n[macros.B]\nparams = { a = \"int\", b = \"any\", c = \"table\" }\ndefaults = { c = { macro = \"C\" } }\nbody = { a = \"${a}\", b = \"${b}\", c = [\"${c}\"] }\n[macros.C]\nbase = \"B\"\nwith = { a = 2, b = {}, c = {} }\n[[x]]\nmacro = \"A\"\nb = 3\n")
+	f.Add("[macros.Hit]\nparams = { pos = \"int\", vel = \"any\" }\nbody = { pos = \"${pos}\", vel = \"${vel}\" }\n[macros.Drum]\nparams = { pos = \"array\", vel = \"any\", lists = \"table\" }\ndefaults = { lists = { pos = [9], vel = { k = [1] } } }\nbody = [{ macro = \"Hit\", each = { pos = \"${pos}\", vel = \"${vel}\" } }, { macro = \"Hit\", each = \"${lists}\" }]\n[x]\na = [{ macro = \"Drum\", each = { pos = [[0, 4]], vel = 0.5 } }, { macro = \"Drum\", pos = [2], vel = [0.25] }]\n")
+	f.Add("[macros.Z]\nparams = { a = \"int\", v = \"float\", p = \"any\" }\ndefaults = { p = false }\nbody = { A = \"${v}\", B = \"${p}\", C = [\"${p}\"] }\n[x]\ny = [{}, { C = [false] }]\n")
+	f.Add(bank(2))
+	f.Fuzz(func(t *testing.T, src string) {
+		doc, err := toml.NewParser([]byte(src)).Parse()
+		if err != nil {
+			return
+		}
+		var s Set
+		if s.Define(doc) != nil {
+			return
+		}
+		out, err := s.Expand(doc)
+		if err != nil {
+			return
+		}
+		kept := normalize(out)
+		for _, in := range []any{out, asStruct(out)} {
+			folded, err := s.Fold(in)
+			if err != nil {
+				if !strings.Contains(err.Error(), "fold exceeds") {
+					t.Fatalf("fold: %v", err)
+				}
+				return
+			}
+			if !reflect.DeepEqual(out, kept) {
+				t.Fatal("the fold changed its value")
+			}
+			held := map[uintptr]bool{}
+			hold(t, held, folded)
+			hold(t, held, in)
+			s.spent = 0
+			back, err := s.Expand(folded.(map[string]any))
+			if err != nil {
+				t.Fatalf("the fold %v does not expand: %v", folded, err)
+			}
+			if !covers(back, in) {
+				t.Fatalf("the fold %v\nexpands to %v\n     not %v", folded, back, in)
+			}
+			if again, err := s.Fold(back); err != nil || !reflect.DeepEqual(again, folded) {
+				t.Fatalf("the fold %v\nof its expansion is %v (%v)", folded, again, err)
+			}
+		}
+	})
+}
+
 // bank writes a music bank as its authors do: lanes and lines as macros over
 // one another, and n patterns of four tracks invoking them
 func bank(n int) string {
@@ -1039,6 +1484,28 @@ deg = [0, 2, 4, 7, 4, 2, 0, 2]
 `, i)
 	}
 	return b.String()
+}
+
+// BenchmarkFold is the expansion of BenchmarkExpand's bank folded back to its
+// 336 invocations: read, matched, and checked by expanding it once
+func BenchmarkFold(b *testing.B) {
+	src := bank(84)
+	doc := parse(b, src)
+	s := &Set{MaxValues: math.MaxInt}
+	if err := s.Define(doc); err != nil {
+		b.Fatal(err)
+	}
+	value, err := s.Expand(doc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := s.Fold(value); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // BenchmarkExpand is a bank of 84 patterns, some 15000 values expanded, from
