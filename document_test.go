@@ -1,6 +1,7 @@
 package toml
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"slices"
@@ -141,6 +142,119 @@ func TestCommentsGoWithTheNearerSide(t *testing.T) {
 		if got := string(d.Bytes()); got != c.want {
 			t.Errorf("%s:\n%s\nwant:\n%s", c.name, got, c.want)
 		}
+	}
+}
+
+// TestCommentsAreThoseDeleteTakesAboveEachHeader: element i is what Delete takes
+// from above table i's header, its blank runs cut to one. The file's comments, a
+// staying run's and those inside a table are not there, and a key that is not an
+// array of tables written with headers gives nil.
+func TestCommentsAreThoseDeleteTakesAboveEachHeader(t *testing.T) {
+	for _, c := range []struct {
+		name, doc string
+		want      []string
+		left      string
+	}{
+		{"touching", "a = 1\n\n# one\n# two\n[[t]]\nx = 1\n", []string{"# one\n# two\n"}, "a = 1\n"},
+		{"a tie goes below", "a = 1\n\n# banner\n\n[[t]]\nx = 1\n", []string{"# banner\n\n"}, "a = 1\n"},
+		{"nearer above", "a = 1\n# a's\n\n[[t]]\nx = 1\n", []string{""}, "a = 1\n# a's\n"},
+		{"blank runs cut to one", "a = 1\n# a's\n\n\n\n# far\n\n\n# near\n\n\n[[t]]\nx = 1\n", []string{"# far\n\n# near\n\n"}, "a = 1\n# a's\n"},
+		{"the file's opening", "# file\n\n[[t]]\nx = 1\n", []string{""}, "# file\n"},
+		{"by index", "[[t]]\nx = 1\n\n# second\n[[t]]\nx = 2\n\n[[t]]\nx = 3\n", []string{"", "# second\n", ""}, ""},
+		{"inside a table", "[[t]] # a line's end\n# a key's\nx = 1\n\n# a sub-table's\n[[t.l]]\ny = 1\n# under the last key\n\n[[t]]\nx = 2\n", []string{"", ""}, ""},
+		{"a run that stays", "a = 1\n\n# the run's\n\n# the header's\n[[t]]\nx = 1\n[u]\ny = 1\n", []string{"# the header's\n"}, "a = 1\n\n# the run's\n\n[u]\ny = 1\n"},
+		{"an inline array", "# about t\nt = [{ x = 1 }]\n", nil, ""},
+		{"a table", "# about t\n[t]\nx = 1\n", nil, ""},
+	} {
+		d, err := ParseDocument([]byte(c.doc))
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		got := d.Comments(Key{"t"})
+		if tables, _ := d.Tree()["t"].([]map[string]any); len(got) != len(c.want) || len(got) != len(tables) {
+			t.Fatalf("%s: %d elements for %d tables, want %d", c.name, len(got), len(tables), len(c.want))
+		}
+		for i := range got {
+			if string(got[i]) != c.want[i] {
+				t.Errorf("%s: table %d has %q, want %q", c.name, i, got[i], c.want[i])
+			}
+		}
+		if d.Comments(Key{"absent"}) != nil {
+			t.Errorf("%s: an absent key has comments", c.name)
+		}
+		if err := del(d, Key{"t"}); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := string(d.Bytes()); got != c.left {
+			t.Errorf("%s: delete leaves:\n%s\nwant:\n%s", c.name, got, c.left)
+		}
+	}
+}
+
+// TestCommentsWrittenBackAreTheSameTables: what Delete leaves, then each table
+// under one blank line as its comments and its header, gives the same comments
+// to the same tables and rebuilds to the same bytes, whatever blank lines parted
+// them in the source. A comment left closing the document, apart from what is
+// above it, becomes the first table's, so that layout is not tried.
+func TestCommentsWrittenBackAreTheSameTables(t *testing.T) {
+	rebuilt := func(data []byte) (out []byte, own [][]byte, closes bool) {
+		d, err := ParseDocument(data)
+		if err != nil {
+			t.Fatalf("%v:\n%s", err, data)
+		}
+		own = d.Comments(Key{"t"})
+		tables := d.Tree()["t"].([]map[string]any)
+		if err := del(d, Key{"t"}); err != nil {
+			t.Fatal(err)
+		}
+		if out = bytes.TrimRight(slices.Clone(d.Bytes()), "\n"); len(out) > 0 {
+			out = append(out, '\n')
+		}
+		for i, table := range tables {
+			body, err := Marshal(map[string]any{"t": []map[string]any{table}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out) > 0 {
+				out = append(out, '\n')
+			}
+			out = append(append(out, own[i]...), body...)
+		}
+		return out, own, d.foot >= 0
+	}
+	blank := func(n int) string { return strings.Repeat("\n", n) }
+	groups := []string{""}
+	for under := 0; under <= 3; under++ {
+		groups = append(groups, "# one\n# more\n"+blank(under))
+		for between := 1; between <= 3; between++ {
+			groups = append(groups, "# far\n"+blank(between)+"# near\n"+blank(under))
+		}
+	}
+	tried := 0
+	for _, above := range []string{"", "# file\n", "a = 1\n", "a = 1\n# a's\n"} {
+		for _, below := range []string{"", "\n[z]\nq = 1\n"} {
+			for gap := 0; gap <= 3; gap++ {
+				for _, c := range groups {
+					doc := above + blank(gap) + c + "[[t]]\n# in\nx = 1 # end\n\n# sub\n[[t.l]]\ny = 1\n# under y\n" +
+						blank(gap) + strings.ToUpper(c) + "[[t]]\nx = 2\n" + below
+					first, own, closes := rebuilt([]byte(doc))
+					if closes {
+						continue
+					}
+					tried++
+					second, again, _ := rebuilt(first)
+					if !reflect.DeepEqual(own, again) {
+						t.Fatalf("comments %q came back as %q:\n%s\nrebuilt:\n%s", own, again, doc, first)
+					}
+					if !bytes.Equal(first, second) {
+						t.Fatalf("a second rebuild changed:\n%s\nto:\n%s", first, second)
+					}
+				}
+			}
+		}
+	}
+	if tried == 0 {
+		t.Fatal("no layout tried")
 	}
 }
 

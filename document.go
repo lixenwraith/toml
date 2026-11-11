@@ -387,6 +387,40 @@ func (d *Document) Delete(key Key) (bool, error) {
 	return true, d.replace(append(out, d.data[at:]...))
 }
 
+// Comments gives, for each [[key]] header in the document's order, the lines above
+// it that Delete(key) takes as that table's own: its comments as written, each run
+// of blank lines among or under them cut to one, nil where it has none. Written
+// under a blank line and above the table's header they are that table's again. A
+// key that is not an array of tables written with headers gives nil.
+func (d *Document) Comments(key Key) [][]byte {
+	var out [][]byte
+	k := 0
+	for i, s := range d.stmts {
+		if !s.header || !s.array || !slices.Equal(s.key, key) {
+			continue
+		}
+		for d.units[k].last <= i {
+			k++
+		}
+		// a run this header opens goes whole when its headers do: a key is under its header
+		from := s.lead
+		if u := d.units[k]; u.first == i && !slices.ContainsFunc(d.stmts[i:u.last], func(s statement) bool { return s.header && !s.key.under(key) }) {
+			from = u.start
+		}
+		var own []byte
+		for b, blank := d.data[from:s.start], false; len(b) > 0; {
+			n := bytes.IndexByte(b, '\n') + 1
+			if empty := len(bytes.TrimSpace(b[:n])) == 0; !empty || !blank {
+				own = append(own, b[:n]...)
+				blank = empty
+			}
+			b = b[n:]
+		}
+		out = append(out, own)
+	}
+	return out
+}
+
 // inline reports a key's value is an inline table or an array
 func (d *Document) inline(s statement) bool {
 	c := d.data[s.value[0]]
