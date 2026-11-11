@@ -374,8 +374,9 @@ folded, err := set.Fold(value) // expands to value again
 
   It is never read the other way: a fold drops no key its value holds. In
   counting, a key holding a zero costs nothing in the value, there or not, and
-  what it writes in a body, so a value folds the same from a struct's shape as
-  from its expansion.
+  what it writes in a body, so a struct's shape folds to the invocations its
+  expansion does. A zero left out of an `any` parameter is written `0`, unless
+  a value that is there says which zero it is.
 - **Checked.** What a fold writes, the expander itself expands, and the result
   is compared with the value under that rule before `Fold` returns. An
   invocation that does not come back is dropped and its part left as it was.

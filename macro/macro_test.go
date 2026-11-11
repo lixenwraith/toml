@@ -1238,6 +1238,24 @@ event = [{ macro = "Hit", pos = 0 }, { macro = "Hit", pos = 4, vel = 0.5 }, { ki
 `)
 }
 
+// A key a struct left out says only that an any parameter is some zero: a value
+// that is there says which, and with none it is written 0.
+func TestAZeroLeftOutOfAnAnyParameterIsSettledByAValueThatIsThere(t *testing.T) {
+	folds(t, `
+[macros.Flag]
+params = { u = "any", k = "int" }
+body = { kind = "flag", k = "${k}", c = "${u}", list = ["${u}"] }
+
+[doc]
+there = { kind = "flag", k = 3, list = [false] }
+none = [{ kind = "flag", k = 3, list = [0] }, { kind = "flag", k = 3, c = "", list = [""] }]
+`, `
+[doc]
+there = { macro = "Flag", k = 3, u = false }
+none = [{ macro = "Flag", k = 3, u = 0 }, { macro = "Flag", k = 3, u = "" }]
+`)
+}
+
 // A fold is checked before it stands: an invocation the expander does not
 // expand to what it replaces is dropped and the part left as it was.
 func TestAnInvocationThatDoesNotExpandBackIsDropped(t *testing.T) {

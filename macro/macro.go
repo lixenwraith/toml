@@ -1,8 +1,8 @@
-// Package macro expands macros in a parsed TOML document. A macro is data
-// under the document's [macros] table; any table carrying a "macro" key invokes
-// one and is replaced by its body with the arguments substituted. Expansion reads
-// nothing but the documents it is given, so equal bytes expand to equal trees on
-// every peer. Syntax: the Macros section of the module README.
+// Package macro expands macros in a parsed TOML document, and folds a value
+// back into them. A macro is data under the document's [macros] table; a table
+// carrying a "macro" key invokes one and is replaced by its body, the arguments
+// substituted. Both read nothing but what they are given, so equal bytes expand
+// to equal trees on every peer. Syntax: the Macros section of the module README.
 package macro
 
 import (
@@ -2302,9 +2302,9 @@ func (f *folder) nth(n *node, fr frame, i int) (slot, int) {
 }
 
 // gather binds the arguments an each left free to the values its expansions
-// took, done of them for each loose field in turn: one value where they all
-// agree and the parameter takes one, else their array; a field in unset, which
-// no expansion settled, stays free. Where no array is left to count the
+// took, done of them for each loose field in turn: their array, or one value
+// where they all agree and the parameter takes one, which a field in unset,
+// that no expansion read, leaves free. Where no array is left to count the
 // expansions by, the first argument that can be one is.
 func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, done int, known bool) bool {
 	open, counted := bits.OnesCount64(loose), known || done == 1
@@ -2331,7 +2331,7 @@ func (f *folder) gather(lists *node, lf frame, loose, unset uint64, vals []any, 
 					_, agree = take(k, vals[c])
 					agree = agree && (a == nil || a.table) || a == unknown && k != kindArray
 				}
-				if !agree && done > 0 && unset>>i&1 == 0 {
+				if !agree && done > 0 {
 					arrays, counted = arrays|1<<c, true
 				}
 			case !counted && (k == kindAny || k == kindArray), arrays>>c&1 != 0:
