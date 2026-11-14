@@ -137,15 +137,18 @@ split at the widest gap.
   header, under its last key, at a line's end) is not returned and is lost; one
   that ends what is left of the document, a blank line above it, becomes the
   first table's.
-- `Fill` adds each key another document sets that this one does not, as that
-  one writes it with the comments that are its own there, and names them: a
-  newer template's keys reach a file a person edited, every line of the file
-  kept. A key goes after the one the template sets before it in its table when
-  the file sets that, else after its table's header, else where `Set` puts it;
-  a table the file lacks comes as its header and that header's comments, where
-  `Set` puts a new table. A value the file holds at a key or over it (its own,
-  an inline table or an array of tables) stays the file's; the template's arrays
-  of tables are left out. The edit is one splice and one parse, linear in both.
+- `Fill` adds each key another document sets that this one does not, as that one
+  writes it with the comments that are its own there, and names them: a newer
+  template's keys reach a file a person edited, every line of the file kept. A key
+  goes after the one the template sets before it in its table when the file sets
+  that, else after its table's header, else where `Set` puts it. A table the file
+  lacks comes as its header and that header's comments after the table the
+  template heads before it, else above the next one the template heads that the
+  file has a header for, else where `Set` puts a new table, a blank line apart, so
+  the file keeps the template's order. A value the file holds at a key or over it
+  (its own, an inline table or an array of tables) stays the file's; the
+  template's arrays of tables are left out. The edit is one splice and one parse,
+  linear in both.
 - `Unmapped` names the keys no field of the destination takes, matched as `Decode`
   matches them (tags, then field names; unexported and `-` fields take nothing),
   each once and sorted. A map or interface destination takes every key under it;

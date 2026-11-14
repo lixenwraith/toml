@@ -378,6 +378,35 @@ resume = true
 	}
 }
 
+// TestFillPutsATableWhereSrcHeadsIt: a table d lacks goes after the table src
+// heads before it, past the comments that run keeps, else above the next table d
+// has a header for and its comments, a blank line apart either way; one under
+// root keys of d's that a header would take goes at the end.
+func TestFillPutsATableWhereSrcHeadsIt(t *testing.T) {
+	d, err := ParseDocument([]byte("title = \"mine\"\n\n# my a\n[a]\nx = 10\n[c]\nz = 30\n# about z\n\n# end\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := ParseDocument([]byte("# template\ntitle = \"\"\n\n# z first\n[z]\nq = 0\n\n[a]\nx = 1\n\n# b, new\n[b]\ny = 2\n[b.sub]\nv = 0\n\n[c]\nz = 3\n\n# d, new\n[d]\nw = 4\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, err := d.Fill(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "title = \"mine\"\n\n# z first\n[z]\nq = 0\n\n# my a\n[a]\nx = 10\n\n# b, new\n[b]\ny = 2\n\n[b.sub]\nv = 0\n\n" +
+		"[c]\nz = 30\n# about z\n\n# d, new\n[d]\nw = 4\n\n# end\n"
+	if got := string(d.Bytes()); got != want || fmt.Sprint(added) != "[z.q b.y b.sub.v d.w]" {
+		t.Errorf("added %v, filled:\n%s\nwant:\n%s", added, got, want)
+	}
+	d, _ = ParseDocument([]byte("a.x = 1\nk = 2\n"))
+	src, _ = ParseDocument([]byte("[a]\nx = 0\n\n[b]\ny = 1\n"))
+	if _, err := d.Fill(src); err != nil || string(d.Bytes()) != "a.x = 1\nk = 2\n\n[b]\ny = 1\n" {
+		t.Errorf("root keys taken by a header, %v:\n%s", err, d.Bytes())
+	}
+}
+
 // TestFillLeavesWhatDHolds: a key d sets, one inside d's inline table or array of
 // tables, or one under d's value stays d's, src's arrays of tables are left out,
 // and a key d's table spells dotted is spelled so.
@@ -474,7 +503,8 @@ func TestKeyStringQuotesWhatABareKeyCannotHold(t *testing.T) {
 // FuzzDocument: a document that parses keeps its bytes; deleting any key it sets
 // leaves a shorter document that parses without that key, of whole lines it had
 // in their order, and setting one or a key beside it, where the edit is taken,
-// leaves it holding the value set, a new key keeping every line it had.
+// leaves it holding the value set, a new key keeping every line it had. A fill
+// keeps every line and value it had and reads each key it adds as its source does.
 func FuzzDocument(f *testing.F) {
 	for _, s := range []string{
 		settingsDoc,
@@ -529,12 +559,18 @@ func FuzzDocument(f *testing.F) {
 		for _, pair := range [][2]string{{string(data), string(data)}, {string(data), settingsDoc}, {settingsDoc, string(data)}, {"", string(data)}} {
 			c, _ := ParseDocument([]byte(pair[0]))
 			s, _ := ParseDocument([]byte(pair[1]))
+			stmts, tree := c.stmts, c.Tree()
 			added, err := c.Fill(s)
 			if err != nil {
 				t.Fatalf("fill of %q from %q: %v", pair[0], pair[1], err)
 			}
 			if !keptLines([]byte(pair[0]), c.Bytes()) {
 				t.Fatalf("fill of %q lost a line:\n%s", pair[0], c.Bytes())
+			}
+			for _, st := range stmts {
+				if k := st.path(); !st.header && !reflect.DeepEqual(value(c.Tree(), k), value(tree, k)) {
+					t.Fatalf("fill of %q moved %s:\n%s", pair[0], k, c.Bytes())
+				}
 			}
 			if pair[0] == pair[1] && len(added) > 0 {
 				t.Fatalf("fill from itself added %v", added)

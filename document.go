@@ -515,6 +515,121 @@ func (d *Document) newTable() spot {
 	return spot{at: len(d.data), head: "\n", table: true}
 }
 
+// apart is the spot a new table goes in at at, a line start: a blank line apart
+// from the lines above and below unless one already is
+func (d *Document) apart(at int) spot {
+	sp := spot{at: at, table: true}
+	if above := d.data[:max(at-1, 0)]; at > 0 && len(bytes.TrimSpace(d.data[bytes.LastIndexByte(above, '\n')+1:at])) > 0 {
+		sp.head = "\n"
+	}
+	if line, _, _ := bytes.Cut(d.data[at:], []byte("\n")); len(bytes.TrimSpace(line)) > 0 {
+		sp.foot = "\n"
+	}
+	return sp
+}
+
+// head is a table src heads, by its name, as Fill places one d lacks: the last
+// statement d sets under it and the first header d has for a table src heads after
+// it, -1 for none
+type head struct {
+	name       string
+	last, next int
+}
+
+// heads is the tables src heads in its order, arrays of tables and what is under
+// one left out, read against d in one walk of each
+func (d *Document) heads(src *Document) []head {
+	type node struct {
+		sub          map[string]*node
+		last, header int
+	}
+	root := &node{}
+	var (
+		out   []head
+		nodes []*node
+		under tables
+	)
+	for _, s := range src.stmts {
+		if s.header && s.array {
+			under.at(s.key).headed = true
+		}
+		if !s.header || under.headedOver(s.key) {
+			continue
+		}
+		n := root
+		for _, k := range s.key {
+			c := n.sub[k]
+			if c == nil {
+				c = &node{last: -1, header: -1}
+				if n.sub == nil {
+					n.sub = make(map[string]*node)
+				}
+				n.sub[k] = c
+			}
+			n = c
+		}
+		out, nodes = append(out, head{name: s.key.String()}), append(nodes, n)
+	}
+	for i, s := range d.stmts {
+		p := s.path()
+		if !s.header {
+			p = p[:len(p)-1]
+		}
+		n := root
+		for _, k := range p {
+			if n = n.sub[k]; n == nil {
+				break
+			}
+			n.last = i
+		}
+		if n != nil && n != root && s.header && !s.array && n.header < 0 {
+			n.header = i
+		}
+	}
+	next := -1
+	for j := len(nodes) - 1; j >= 0; j-- {
+		out[j].last, out[j].next = nodes[j].last, next
+		if nodes[j].header >= 0 {
+			next = nodes[j].header
+		}
+	}
+	return out
+}
+
+// after is the spot past the statement at i and the comments its run keeps, when
+// a header or the end follows, as a table placed there needs
+func (d *Document) after(i int) (spot, bool) {
+	if i < 0 || i+1 < len(d.stmts) && !d.stmts[i+1].header {
+		return spot{}, false
+	}
+	if u := d.units[d.unitOf(i)]; u.last == i+1 {
+		return d.apart(u.end), true
+	}
+	return d.apart(d.stmts[i].end), true
+}
+
+// above is the spot above the header at i and the comments that are its own
+func (d *Document) above(i int) spot {
+	if u := d.units[d.unitOf(i)]; u.first == i {
+		return d.apart(u.start)
+	}
+	return d.apart(d.stmts[i].lead)
+}
+
+// unitOf is the index of the unit holding the statement at i
+func (d *Document) unitOf(i int) int {
+	k, _ := slices.BinarySearchFunc(d.units, i, func(u unit, i int) int {
+		switch {
+		case u.last <= i:
+			return -1
+		case u.first > i:
+			return 1
+		}
+		return 0
+	})
+	return k
+}
+
 // splice writes each insertion at its spot, those at one byte in order, none
 // opening the file with a blank line, and makes the result the document once it
 // parses
@@ -545,9 +660,11 @@ func (d *Document) splice(ins []*insertion) error {
 // Fill adds each key src sets that d does not, as src writes it with the comments
 // that are its own there, and names them in src's order. A key goes after the one
 // src sets before it in its table when d sets that, else after its table's header,
-// else where Set puts it; a table d lacks comes as its header and that header's
-// comments, where Set puts a new table. A value d holds at a key or over it, an
-// inline table or an array of tables, stays d's; src's arrays of tables are left out.
+// else where Set puts it. A table d lacks comes as its header and that header's
+// comments after the table src heads before it, else above the next one src heads
+// that d has a header for, else where Set puts a new table, a blank line apart. A
+// value d holds at a key or over it, an inline table or an array of tables, stays
+// d's; src's arrays of tables are left out.
 func (d *Document) Fill(src *Document) ([]Key, error) {
 	keys, headers := make(map[string]statement), make(map[string]statement)
 	for _, s := range d.stmts {
@@ -558,10 +675,12 @@ func (d *Document) Fill(src *Document) ([]Key, error) {
 			headers[k] = s
 		}
 	}
+	heads := d.heads(src)
 	var (
 		added  []Key
 		arrays tables // the arrays of tables src's headers name
 		ins    []*insertion
+		nth    = -1 // the index in heads of the table src headed last
 	)
 	past := make(map[int]*insertion)      // what goes past a statement of d, by its end
 	placed := make(map[string]*insertion) // where each key Fill adds goes, by the key
@@ -584,6 +703,9 @@ func (d *Document) Fill(src *Document) ([]Key, error) {
 		if arrays.headedOver(p) {
 			continue
 		}
+		if s.header {
+			nth++
+		}
 		name, table := p.String(), p[:len(p)-1]
 		prev := last[table.String()].String()
 		if !s.header {
@@ -597,7 +719,22 @@ func (d *Document) Fill(src *Document) ([]Key, error) {
 		var in *insertion
 		switch {
 		case s.header:
-			at := d.newTable()
+			at, ok := spot{}, false
+			if nth > 0 {
+				if prev := placed[heads[nth-1].name]; prev != nil {
+					// right after the table Fill placed, which hands it what it ends with
+					at, ok = prev.spot, true
+					at.head, prev.foot = "\n", ""
+				} else {
+					at, ok = d.after(heads[nth-1].last)
+				}
+			}
+			if next := heads[nth].next; !ok && next >= 0 {
+				at, ok = d.above(next), true
+			}
+			if !ok {
+				at = d.newTable()
+			}
 			at.scope = p
 			in = open(at)
 		case prev != "" && placed[prev] != nil:
