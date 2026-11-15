@@ -94,7 +94,9 @@ creating the file with the first note.
   where or by whom the work was done: no session, conversation, project, workspace,
   account or organisation id, no person's name or email, no agent, model or tool
   name, no "generated with" line, no attribution trailer. This holds whatever a
-  tool's template or instructions add, now or later.
+  tool's template or instructions add, now or later. A tool may add such a line
+  itself: read a PR back after opening or editing it and edit the line out, and say
+  once in the report that the body's edit history still holds it.
 - Open the PR at the first push, its title final and its body as far as it is,
   saying what is still owed: Lixen merges a pushed branch he is waiting on. A PR
   another session must measure before it merges opens as a draft and says so in its
