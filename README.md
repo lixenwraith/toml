@@ -99,10 +99,10 @@ data = doc.Bytes()
 ```
 
 `ParseDocument` parses as `Parse` does and keeps the bytes. An edit rewrites only
-the statements it names, with the comments that are theirs, so blank lines,
-order, every other comment and the spelling of every other value stay as
-written; the result is parsed again, and an edit it would not parse after is
-refused with the document unchanged.
+what it changes, a statement or the part of a value that reads otherwise, with
+the comments that are theirs, so blank lines, order, every other comment and the
+spelling of every other value stay as written; the result is parsed again, and
+an edit it would not parse after is refused with the document unchanged.
 
 A group of comment lines belongs to whichever side fewer blank lines part it
 from, the side below on a tie: the statement right under it, or the run of
@@ -112,19 +112,45 @@ the end with one above it, belongs to the file and stays, while one touching
 the last statement is that statement's run's. Between two runs, several groups
 split at the widest gap.
 
-- `Set` replaces the value of a key the document sets, keeping the rest of its
-  line and its comment. A key it lacks goes after the last key of its table,
-  spelled as that key is (`play.mouse` beside `play.hud`), else after the table's
-  header, else in a `[table]` appended at the end, above the file's closing
-  comments. A root key with no other goes above the first table and its
-  comments, or with no table above the file's closing comments. A key under an
-  array of tables, inside an inline table or array, or naming a table fails. The
-  value is encoded as `Marshal` writes one.
+- `Set` gives a key a value and writes only what then reads otherwise, encoding
+  what is new as `Marshal` writes a value. The value is compared as `Parse` reads
+  it, so the tree `Tree` hands out may be changed and set again.
+  - A value that reads the same stays as written: `0x10` set to 16, an array
+    over several lines set to its own elements.
+  - An inline table keeps each key's place and spelling. A key that reads
+    otherwise is written again where it stands, one the value lacks goes with
+    the lines that are its own, and a new one is added last. A key inside one
+    is named through it, at any depth: `Set(Key{"state", "x"}, 25)` for
+    `state = { macro = "Pylon", x = 20 }`, added when it is missing.
+  - An array keeps each element that reads the same, with its comments. The
+    elements are paired in order: those that read alike, then the tables that
+    are kin, half the keys of the larger reading the same, then the rest by
+    their places. One changed is written again in its place, one gone takes its
+    lines, and a new one stands as the element before it does, on a line of its
+    own or beside it. A stretch with over 4096 pairs to compare goes by place.
+  - A table under headers or dotted keys is set a key at a time: each key of
+    the value where it stands, or added, and every other key deleted.
+  - An array of tables under `[[headers]]` keeps each table that reads the
+    same. One changed is set as a table is, within its own statements; one gone
+    goes with its comments; a new one is written as `Marshal` writes a table,
+    below the table before it.
+  - A key the document lacks goes after the last key of its table, spelled as
+    that key is (`play.mouse` beside `play.hud`), else after the table's header,
+    else in a `[table]` appended at the end, above the file's closing comments.
+    A root key with no other goes above the first table and its comments, or
+    with no table above the file's closing comments.
+  - It fails for a key under an array of tables, which has no way to name one
+    table (set the array); for a key inside a value that is no table; and for a
+    value that is no table over a table under headers, or no array of tables
+    over an array of them.
+  - Tables under headers are set a statement at a time, a parse each.
 - `Delete` removes the key and every key under it: each statement setting one and
   each header naming one, in every table of an array of tables, each with its
   comments. A run of statements going whole takes the comments that belong to
-  it and one blank run beside it. It reports whether it removed anything; a key
-  inside an inline value fails.
+  it and one blank run beside it. A key inside an inline table goes from it,
+  and from every table of an array it is reached through: `items.odd` from each
+  table of `items = [{ id = 1, odd = 1 }, { id = 2 }]`. It reports whether it
+  removed anything.
 - `Comments` gives what `Delete` takes from above each `[[key]]` header of an
   array of tables, one element a header in the document's order, so element i
   is table i of the array in `Tree`: the comment lines that are that table's
@@ -140,15 +166,17 @@ split at the widest gap.
 - `Fill` adds each key another document sets that this one does not, as that one
   writes it with the comments that are its own there, and names them: a newer
   template's keys reach a file a person edited, every line of the file kept. A key
+  under a table the file writes inline joins that table as `Set` adds one, without
+  the template's comments, which a line has no room for. Any other key
   goes after the one the template sets before it in its table when the file sets
   that, else after its table's header, else where `Set` puts it. A table the file
   lacks comes as its header and that header's comments after the table the
   template heads before it, else above the next one the template heads that the
   file has a header for, else where `Set` puts a new table, a blank line apart, so
   the file keeps the template's order. A value the file holds at a key or over it
-  (its own, an inline table or an array of tables) stays the file's; the
-  template's arrays of tables are left out. The edit is one splice and one parse,
-  linear in both.
+  (its own, or an array of tables) stays the file's; the template's arrays of
+  tables are left out. The edit is one splice and one parse, and one more of each
+  where an inline table gains a key, linear in both.
 - `Unmapped` names the keys no field of the destination takes, matched as `Decode`
   matches them (tags, then field names; unexported and `-` fields take nothing),
   each once and sorted. A map or interface destination takes every key under it;
